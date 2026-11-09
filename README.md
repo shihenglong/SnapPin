@@ -7,7 +7,8 @@ Python + PySide6 实现的 PixPin 核心功能复刻：**截图 / 贴图 / OCR �
 ## 下载（Windows）
 
 到 [Releases](https://github.com/shihenglong/SnapPin/releases/latest) 下载
-`SnapPin-x.y.z-windows-x64.zip`，解压后运行 `SnapPin.exe`（免安装，绿色版）。
+`SnapPin-x.y.z-windows-x64.zip`（标准版）或 `SnapPin-x.y.z-full-windows-x64.zip`
+（full 版，内置离线翻译插件），解压后运行 `SnapPin.exe`（免安装，绿色版）。
 
 - 仅支持 Windows 10/11 x64。
 - **升级方式**：下载新 zip 直接覆盖解压即可。所有用户数据（配置 / 剪贴板历史 /
@@ -63,7 +64,9 @@ SNAPPIN_DEBUG=1 python main.py > snappin.log 2>&1
 - **GLM API（智谱）**：`https://open.bigmodel.cn/api/paas/v4` · `glm-4.7-flash`，填 Key 即用，一次请求批量。
 - **MiniMax API**：`https://api.minimaxi.com/v1` · `MiniMax-M2`。
 - **自定义**：任意 OpenAI 兼容 `/chat/completions` 端点。
-- **离线插件**：`vendor/plugins/translation/translator-engine.exe`（Bergamot），零网络零密钥。
+- **离线插件（神经翻译）**：CTranslate2 + OPUS-MT int8 模型，零网络零密钥，CPU 单批 <0.5s。
+  **full 版安装包已内置**；标准版在 设置 → 翻译 → 离线插件 点「下载」（约 107MB，
+  引擎包 39.7MB + en-zh 模型包 67MB），或手动解压插件包到 `vendor/plugins/translation/`。
 - 目标语言支持 简体中文 / English / 日本語；所有引擎失败时最终兜底离线插件，保证可用。
 
 ## 剪贴板历史（Ditto 风格）

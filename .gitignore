@@ -22,3 +22,6 @@ tools/models/
 # 离线翻译插件运行件（用户下载安装，不入库）
 vendor/plugins/translation/engine/
 vendor/plugins/translation/models/
+
+# 发布包产物不得入库
+/SnapPin-*.zip
