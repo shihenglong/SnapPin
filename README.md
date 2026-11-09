@@ -10,6 +10,8 @@ Python + PySide6 实现的 PixPin 核心功能复刻：**截图 / 贴图 / OCR �
 `SnapPin-x.y.z-windows-x64.zip`，解压后运行 `SnapPin.exe`（免安装，绿色版）。
 
 - 仅支持 Windows 10/11 x64。
+- **升级方式**：下载新 zip 直接覆盖解压即可。所有用户数据（配置 / 剪贴板历史 /
+  密码库 / 缓存）都存放在 `%APPDATA%\SnapPin`，与程序目录完全分离，替换程序不会丢数据。
 - 应用内置**自动检查更新**（GitHub Releases），也可在 设置 → 关于 手动检查。
 
 ## 界面预览

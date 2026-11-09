@@ -9,10 +9,15 @@ import threading
 import faulthandler
 import config as _config
 
-if sys.stderr is None:            # pythonw 无控制台：stderr/stdout 重定向到日志文件
-    _log_path = os.path.join(_config.APP_DIR, "snappin.log")
-    sys.stderr = open(_log_path, "a", buffering=1, encoding="utf-8", errors="replace")
-    sys.stdout = sys.stderr
+if sys.stderr is None:            # pythonw/打包 exe 无控制台：重定向到日志文件
+    try:
+        os.makedirs(_config.APP_DIR, exist_ok=True)   # 新机器首启目录还不存在
+        _log_path = os.path.join(_config.APP_DIR, "snappin.log")
+        sys.stderr = open(_log_path, "a", buffering=1, encoding="utf-8", errors="replace")
+        sys.stdout = sys.stderr
+    except Exception:
+        sys.stderr = open(os.devnull, "w")   # 目录不可写也不能挡启动
+        sys.stdout = sys.stderr
 if sys.stderr is not None:
     faulthandler.enable()         # 崩溃栈也会写进日志
 

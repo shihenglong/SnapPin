@@ -12,37 +12,7 @@ def app_root() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
-def _migrate_old_dir() -> None:
-    r"""一次性迁移：%APPDATA%\PyPin → %APPDATA%\SnapPin。
-
-    逐项搬（config.json / clip.db / pw.db / assets）：目录级 rename 会被
-    旧版实例占用的文件句柄卡死而整体失败，逐项 + 复制兜底能把没被锁的先迁走。
-    仅当新目录缺该项时才迁，不覆盖任何已有数据。
-    """
-    import shutil
-    old = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "PyPin")
-    if not os.path.isdir(old):
-        return
-    try:
-        os.makedirs(APP_DIR, exist_ok=True)
-        for name in ("config.json", "clip.db", "pw.db"):
-            src = os.path.join(old, name)
-            dst = os.path.join(APP_DIR, name)
-            if os.path.exists(src) and not os.path.exists(dst):
-                try:
-                    os.rename(src, dst)
-                except Exception:
-                    shutil.copy2(src, dst)   # 源被旧实例锁定时退化为复制
-        src_assets = os.path.join(old, "assets")
-        dst_assets = os.path.join(APP_DIR, "assets")
-        if os.path.isdir(src_assets) and not os.path.isdir(dst_assets):
-            shutil.copytree(src_assets, dst_assets)
-    except Exception:
-        pass
-
-
 APP_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "SnapPin")
-_migrate_old_dir()
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 
 DEFAULTS = {
@@ -169,10 +139,6 @@ def set_autostart(enable: bool) -> None:
         else:
             try:
                 winreg.DeleteValue(key, "SnapPin")
-            except FileNotFoundError:
-                pass
-            try:  # 清掉改名前的旧键
-                winreg.DeleteValue(key, "PyPin")
             except FileNotFoundError:
                 pass
         winreg.CloseKey(key)
