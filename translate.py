@@ -5,8 +5,8 @@
 Ollama（本地大模型）：自动连接本机 Ollama（http://localhost:11434），
   模型自动检测（优先 Qwen/DeepSeek），不可用自动转离线引擎；
 GLM / MiniMax / 自定义 OpenAI 兼容：一次请求批量翻译全部文字块；
-离线插件：Bergamot translator-engine.exe（vendor/plugins/translation），
-  零网络请求。
+离线插件：CTranslate2 神经引擎 + OPUS-MT int8 模型（vendor/plugins/translation，
+  设置→翻译 内下载安装），零网络请求，CPU 单批 <0.5s。
 
 信号契约不变：done(list[str], int) 按输入顺序回传全部译文，failed(str, int)。
 """
@@ -31,8 +31,10 @@ PRESETS = {
     "local": {},
 }
 
-_LOCAL_EXE = os.path.join(config.app_root(),
-                          "vendor", "plugins", "translation", "translator-engine.exe")
+# 离线引擎：CTranslate2 onedir（engine/）+ 语言对模型（models/<from>-<to>/），
+# 由设置→翻译 下载安装；按需起进程（稳态 ~0.5s），与主程序崩溃隔离
+_TR_PLUGIN = os.path.join(config.app_root(), "vendor", "plugins", "translation")
+_LOCAL_EXE = os.path.join(_TR_PLUGIN, "engine", "translate-engine.exe")
 _LOCAL_LANG = {"zh": "zh", "zh-cn": "zh", "zh-tw": "zh", "en": "en",
                "ja": "ja", "ko": "ko"}
 
@@ -45,6 +47,47 @@ _OLLAMA_TIMEOUT_MS = 120_000
 
 def local_available() -> bool:
     return os.path.isfile(_LOCAL_EXE)
+
+
+# ------------------------------------------------ 离线插件安装（设置→翻译 内下载）
+# GitHub Release 资产名；zip 内部前缀 engine/ 与 models/ 对应插件目录布局
+ASSET_ENGINE = "SnapPin-offline-engine-win64.zip"
+ASSET_MODEL = "SnapPin-offline-model-en-zh.zip"
+
+
+def install_offline(engine_zip: str, model_zip: str) -> tuple[bool, str]:
+    """把下载好的两个插件 zip 解包进插件目录（先校验再落位）。返回 (ok, 提示)。"""
+    import zipfile
+    packs = []
+    for path, need in ((engine_zip, "engine/translate-engine.exe"),
+                       (model_zip, "models/en-zh/model.bin")):
+        try:
+            z = zipfile.ZipFile(path)
+        except Exception as e:                # noqa: BLE001 — 用户文件，损坏要兜住
+            return False, f"插件包无法打开：{e}"
+        if z.testzip() is not None:
+            return False, "插件包 CRC 校验失败"
+        names = z.namelist()
+        if not any(n.startswith(need.split("/")[0] + "/") for n in names) or \
+                not any(n.replace("\\", "/").startswith(need) or
+                        n.replace("\\", "/").endswith(need.split("/")[-1])
+                        for n in names):
+            return False, f"插件包内容不符：缺少 {need}"
+        packs.append(z)
+    try:
+        os.makedirs(_TR_PLUGIN, exist_ok=True)
+        for z in packs:
+            z.extractall(_TR_PLUGIN)          # zipfile 自动剥掉绝对路径与 .. 成分
+    except OSError as e:
+        return False, f"解压失败：{e}"
+    ok = local_available()
+    return ok, ("离线翻译插件安装完成" if ok else "安装完成但未检测到引擎，请重启应用")
+
+
+def installed_pairs() -> list:
+    """已安装的语言对（models/ 下的目录名），如 ['en-zh']。"""
+    root = os.path.join(_TR_PLUGIN, "models")
+    return sorted(d for d in (os.listdir(root) if os.path.isdir(root) else []))
 
 
 class TranslateClient(QObject):
@@ -73,8 +116,9 @@ class TranslateClient(QObject):
             base = tc.get("api_base") or _OLLAMA_HOST
             return True, f"Ollama 本地大模型 · {base}（模型自动检测）"
         if engine == "local":
-            return local_available(), ("本地离线插件就绪" if local_available()
-                                       else "未找到离线插件 translator-engine.exe")
+            return local_available(), ("离线插件就绪（CTranslate2 神经翻译，零网络请求）"
+                                       if local_available()
+                                       else "未安装离线插件——在下方「下载离线翻译插件」获取")
         if not tc.get("api_key"):
             return True, "未配置 API 密钥，自动改用免 Key 在线直连"
         return True, f"{engine.upper()} · {self._model_of(engine)}"

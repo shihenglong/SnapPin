@@ -4,10 +4,14 @@
 - 快捷键集中一页，按「截图与贴图」「剪贴板」分组（剪贴板历史热键也从剪贴板页并入此处）。
 - 新增「翻译」页：GLM / MiniMax / 自定义 OpenAI 兼容 API / 本地离线引擎。
 """
+import json
 import os
+import tempfile
 
-from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtCore import QSize, QUrl, Qt, Signal
 from PySide6.QtGui import QKeyEvent
+from PySide6.QtNetwork import (QNetworkAccessManager, QNetworkReply,
+                               QNetworkRequest)
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QFileDialog,
                                QHBoxLayout, QLabel, QLineEdit, QListWidget,
                                QListWidgetItem, QPushButton, QScrollArea,
@@ -15,6 +19,8 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QFileDialog,
                                QVBoxLayout, QWidget)
 
 import config
+import translate
+import updater
 import version
 from icons import icon
 
@@ -82,7 +88,7 @@ def _check_png() -> str:
 
 _TR_ENGINES = [("online", "在线直连（免 Key）"), ("glm", "GLM API（智谱）"),
                ("minimax", "MiniMax API"), ("custom", "自定义 OpenAI 兼容"),
-               ("ollama", "Ollama（本地大模型）"), ("local", "离线插件（Bergamot）")]
+               ("ollama", "Ollama（本地大模型）"), ("local", "离线插件（神经翻译）")]
 _TR_PRESET_TIP = {
     "online": "免 Key 免配置：Google GTX 直连 + MyMemory 容灾，逐块并发；"
               "双通道都拿不到的块自动转离线插件补齐",
@@ -91,8 +97,9 @@ _TR_PRESET_TIP = {
     "custom": "填写 OpenAI 兼容端点（到 /v1 为止）与模型名；未填 Key 自动用免 Key 在线直连",
     "ollama": "本机 Ollama（http://localhost:11434）模型自动检测、Qwen/DeepSeek 优先；"
               "也支持 OpenAI 兼容本地服务（LM Studio 等，端点以 /v1 结尾自动识别）\n"
-              "0 联网请求；不可用时自动转离线词典（完成提示会标出实际引擎）",
-    "local": "纯离线词典型插件（Bergamot），无需网络与密钥，质量有限",
+              "0 联网请求；不可用时自动转离线插件（完成提示会标出实际引擎）",
+    "local": "CTranslate2 神经翻译（OPUS-MT int8）+ 语言对模型，零网络请求，"
+             "CPU 单批 <0.5s；首次使用需在下方下载插件（约 85MB）",
 }
 
 
@@ -528,6 +535,14 @@ class SettingsDialog(QDialog):
         self._row_base = self._row("API 端点", self.tr_base)
         self._row_key = self._row("API 密钥", key_wrap)
         self._row_model = self._row("模型", self.tr_model)
+        # 离线插件安装行：引擎=离线插件 时显示，未安装变「下载」入口
+        self.btn_tr_dl = QPushButton(
+            "重新下载" if translate.local_available() else "下载离线翻译插件（约 85MB）")
+        self.btn_tr_dl.clicked.connect(self._dl_offline)
+        self._row_tr_dl = self._row(
+            "离线插件", self.btn_tr_dl,
+            "引擎 + en-zh 模型从 GitHub Release 下载，安装到 vendor 后离线可用；"
+            "也可手动解压插件包到 vendor/plugins/translation/")
         card = self._card("翻译引擎", [
             self._row("引擎", self.tr_engine),
             self._tr_preset_tip,
@@ -537,6 +552,7 @@ class SettingsDialog(QDialog):
             self._row("目标语言", self.tr_target,
                       "贴图右键「翻译（替换原图）」的输出语言；全部文字块并发批量翻译，"
                       "完成 toast 显示耗时"),
+            self._row_tr_dl,
             self.tr_status,
         ])
         self._sync_tr_page()
@@ -549,6 +565,7 @@ class SettingsDialog(QDialog):
         self._row_base.setVisible(key in ("glm", "minimax", "custom", "ollama"))
         self._row_key.setVisible(key in ("glm", "minimax", "custom"))
         self._row_model.setVisible(key in ("glm", "minimax", "custom", "ollama"))
+        self._row_tr_dl.setVisible(key == "local")
         self._refresh_tr_status()
 
     def _refresh_tr_status(self):
@@ -559,6 +576,94 @@ class SettingsDialog(QDialog):
             self.tr_status.setText(("● " if ok else "○ ") + tip)
         else:
             self.tr_status.setText("")
+
+    # ---- 离线插件下载安装：Release 资产（引擎包→模型包）顺序拉取，进度显示在按钮上
+    def _dl_offline(self):
+        btn = self.btn_tr_dl
+        if getattr(self, "_tr_dl_busy", False):
+            return
+        self._tr_dl_busy = True
+        btn.setEnabled(False)
+        if not hasattr(self, "_tr_nam"):
+            self._tr_nam = QNetworkAccessManager(self)
+        self.tr_status.setText("○ 正在获取 Release 信息…")
+
+        def fail(msg):
+            self._tr_dl_busy = False
+            btn.setEnabled(True)
+            btn.setText("重新下载")
+            self.tr_status.setText(f"○ 下载失败：{msg}（也可手动下载插件包解压到 vendor）")
+
+        req = QNetworkRequest(QUrl(updater.RELEASE_API))
+        req.setAttribute(QNetworkRequest.RedirectPolicyAttribute,
+                         QNetworkRequest.NoLessSafeRedirectPolicy)
+        reply = self._tr_nam.get(req)
+
+        def got_release(r=reply):
+            r.deleteLater()
+            data = bytes(r.readAll()) if r.error() == QNetworkReply.NoError else b""
+            urls = {}
+            if data:
+                try:
+                    for a in json.loads(data).get("assets", []):
+                        urls[a.get("name", "")] = a.get("browser_download_url", "")
+                except Exception:              # noqa: BLE001 — API 响应异常走统一失败提示
+                    urls = {}
+            queue = [(translate.ASSET_ENGINE, urls.get(translate.ASSET_ENGINE, "")),
+                     (translate.ASSET_MODEL, urls.get(translate.ASSET_MODEL, ""))]
+            missing = [n for n, u in queue if not u]
+            if missing:
+                fail(f"Release 未找到 {missing[0]}")
+                return
+            files = []
+
+            def pull(k=0):
+                _name, url = queue[k]
+                btn.setText(f"下载 {'引擎' if k == 0 else '模型'}包 0%")
+                r = self._tr_nam.get(QNetworkRequest(QUrl(url)))
+                r.setAttribute(QNetworkRequest.RedirectPolicyAttribute,
+                               QNetworkRequest.NoLessSafeRedirectPolicy)
+
+                def prog(recv, total, r=r, k=k):
+                    if total > 0:
+                        btn.setText(f"下载 {'引擎' if k == 0 else '模型'}包 "
+                                    f"{min(99, int(recv * 100 / total))}%")
+
+                def fin(r=r, k=k):
+                    r.deleteLater()
+                    if r.error() != QNetworkReply.NoError:
+                        fail(f"{r.errorString()}")
+                        return
+                    fd, path = tempfile.mkstemp(suffix=".zip", prefix="snappin_tr_")
+                    with os.fdopen(fd, "wb") as f:
+                        f.write(bytes(r.readAll()))
+                    files.append(path)
+                    if k + 1 < len(queue):
+                        pull(k + 1)
+                        return
+                    btn.setText("解压安装…")
+                    ok, msg = translate.install_offline(files[0], files[1])
+                    for p in files:
+                        try:
+                            os.remove(p)
+                        except OSError:
+                            pass
+                    self._tr_dl_busy = False
+                    btn.setEnabled(True)
+                    btn.setText("重新下载")
+                    if not ok:
+                        self.tr_status.setText(f"○ 安装失败：{msg}")
+                        return
+                    self._refresh_tr_status()
+                    n = translate.installed_pairs()
+                    btn.setText(f"重新下载（已装 {'/'.join(n)}）")
+
+                r.downloadProgress.connect(prog)
+                r.finished.connect(fin)
+
+            pull(0)
+
+        reply.finished.connect(got_release)
 
     # ---- 快捷键页：全部热键集中于此（剪贴板相关归一组）
     def _page_hotkey(self):
@@ -763,6 +868,14 @@ if __name__ == "__main__":
                  if dlg.tr_engine.itemData(i) == "local"][0]
     dlg.tr_engine.setCurrentIndex(idx_local)
     assert dlg.tr_engine.currentData() == "local"
+    # 离线插件行：local 下不应显式隐藏（isHidden 只看自身标志，不受父级 stack 影响）
+    assert not dlg._row_tr_dl.isHidden(), "local 引擎下应显示离线插件安装行"
+    assert hasattr(dlg, "_dl_offline"), "下载入口缺失"
+    dlg.tr_engine.setCurrentIndex(idx_local + 1 if idx_local == 0 else 0)
+    assert dlg._row_tr_dl.isHidden(), "非 local 引擎下应隐藏离线插件行"
+    idx_local = [i for i in range(dlg.tr_engine.count())
+                 if dlg.tr_engine.itemData(i) == "local"][0]
+    dlg.tr_engine.setCurrentIndex(idx_local)
     dlg.tr_key.setText("sk-test")  # 本地引擎下填了密钥也不影响
     idx_glm = [i for i in range(dlg.tr_engine.count())
                if dlg.tr_engine.itemData(i) == "glm"][0]

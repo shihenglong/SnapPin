@@ -568,10 +568,10 @@ class PinWindow(QWidget):
         机器上行带直接相接，看起来就是重叠。现在行位置自己算，几何上保证间隙。
 
         纯像素字号（pointSize 受系统 DPI 影响，译文整体偏大约 1/3）：
-        先按原行高给值，逐 px 缩到行数×行进距严格放得下。
+        按原行高的 0.72 给值（用户反馈 0.75 略偏大），逐 px 缩到行数×行进距严格放得下。
         """
         w = max(8, rect.width())
-        size = max(8, int(round(h0 * 0.75)))
+        size = max(8, int(round(h0 * 0.72)))
         while True:
             f = QFont(_tr_family())
             f.setPixelSize(size)

@@ -9,7 +9,7 @@ import version
 
 os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "dist"))
 OUT = f"SnapPin-{version.APP_VERSION}-windows-x64.zip"
-ROOT = "SnapPin"
+ROOT = sys.argv[1] if len(sys.argv) > 1 else "SnapPin"   # 可传暂存目录名
 
 if os.path.exists(OUT):
     os.remove(OUT)
@@ -17,7 +17,7 @@ with zipfile.ZipFile(OUT, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
     for dirpath, _dirs, files in os.walk(ROOT):
         for f in files:
             p = os.path.join(dirpath, f)
-            z.write(p, p.replace(os.sep, "/"))
+            z.write(p, "SnapPin/" + os.path.relpath(p, ROOT).replace(os.sep, "/"))
 
 with zipfile.ZipFile(OUT) as z:
     bad = z.testzip()
