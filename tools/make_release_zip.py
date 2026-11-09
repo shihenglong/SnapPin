@@ -4,8 +4,11 @@ import os
 import sys
 import zipfile
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import version
+
 os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "dist"))
-OUT = "SnapPin-0.4.0-windows-x64.zip"
+OUT = f"SnapPin-{version.APP_VERSION}-windows-x64.zip"
 ROOT = "SnapPin"
 
 if os.path.exists(OUT):

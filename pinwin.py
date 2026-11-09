@@ -1,9 +1,9 @@
 """贴图窗口 v3 — 贴图即取字（拖拽选字/点击复制）+ 分块并发翻译 + 译文按块替换。"""
 import time
 
-from PySide6.QtCore import QPoint, QRect, QRectF, QSize, Qt, QTimer
-from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QIcon, QImage,
-                           QPainter, QPen, QPixmap)
+from PySide6.QtCore import QPoint, QRect, QSize, Qt, QTimer
+from PySide6.QtGui import (QBrush, QColor, QFont, QFontDatabase, QIcon, QImage,
+                           QPainter, QPen, QPixmap, QTextLayout, QTextOption)
 from PySide6.QtWidgets import (QApplication, QLabel, QMenu, QWidget,
                                QGraphicsDropShadowEffect)
 
@@ -35,6 +35,25 @@ def _join_text(a: str, b: str) -> str:
             or '\uff00' <= ch <= '\uffef'
     sep = "" if (cjk(a[-1]) or cjk(b[0])) else " "
     return a + sep + b
+
+
+# 译文渲染字体候选：显式选第一个本机真实安装的家族。
+# 硬编码 "Microsoft YaHei" 在没装雅黑/字体解析被替换的机器上，Qt 按各自规则
+# 换字体，度量与实际字形容易对不齐，译文行间挤成重叠——这是换机才复现的根因。
+_TR_FAMILIES = ("Microsoft YaHei", "Microsoft YaHei UI", "DengXian", "SimHei",
+                "SimSun", "NSimSun", "Noto Sans CJK SC", "Source Han Sans SC",
+                "Source Han Sans CN", "WenQuanYi Micro Hei", "Malgun Gothic",
+                "Meiryo", "Yu Gothic UI", "MS Gothic")
+_TR_FAMILY = None                     # 进程内缓存（字体表启动后不变）
+
+
+def _tr_family() -> str:
+    global _TR_FAMILY
+    if _TR_FAMILY is None:
+        installed = set(QFontDatabase.families())
+        _TR_FAMILY = next((fam for fam in _TR_FAMILIES if fam in installed),
+                          QFont().defaultFamily())
+    return _TR_FAMILY
 
 
 class BoxLayer(QWidget):
@@ -521,37 +540,77 @@ class PinWindow(QWidget):
         img = pm.toImage().convertToFormat(QImage.Format_RGB32)  # 采样只转一次
         p = QPainter(pm)
         p.setRenderHint(QPainter.Antialiasing, True)
+        jobs = []
         for blk, trans in zip(blocks, translations):
             if not trans:
                 continue
             rect = blk["rect"].adjusted(-2, -2, 2, 2)
             bg = self._sample_bg(img, rect)
             fg = self._sample_fg(img, rect, bg)
-            p.setPen(Qt.NoPen)
+            jobs.append((rect, bg, fg, trans, blk["h"]))
+        # 两遍绘制：先全部铺底色、再统一写译文。紧凑排版截图里 OCR 块上下紧挨
+        # （行距小于 ±2px 外扩），单块顺序画会让下一块的底色矩形擦掉上一块刚写的译文。
+        p.setPen(Qt.NoPen)
+        for rect, bg, _fg, _trans, _h in jobs:
             p.setBrush(QBrush(bg))
             p.drawRect(rect)
-            # 纯像素字号（pointSize 受系统 DPI 影响，译文会整体偏大约 1/3 → 行间重叠）：
-            # 先按原行高给值，逐 px 缩到严格放得下
-            size = max(8, int(round(blk["h"] * 0.75)))
-            f = QFont("Microsoft YaHei")
-            f.setPixelSize(size)
-            fm = QFontMetrics(f)
-            w = max(8, rect.width())
-            wrapped = fm.boundingRect(QRect(0, 0, w, 100000), Qt.TextWordWrap, trans)
-            while size > 8 and wrapped.height() > rect.height():
-                size -= 1
-                f.setPixelSize(size)
-                fm = QFontMetrics(f)
-                wrapped = fm.boundingRect(QRect(0, 0, w, 100000), Qt.TextWordWrap, trans)
-            p.setFont(f)
-            p.setPen(QPen(fg, 1))
-            # 极小框缩到下限仍放不下时：顶部对齐 + 裁剪到框内，宁可靠下截断不越界压行
-            p.setClipRect(rect)
-            p.drawText(QRectF(rect), Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, trans)
-            p.setClipping(False)
+        for rect, _bg, fg, trans, h in jobs:
+            self._draw_trans_text(p, rect, fg, trans, h)
         p.end()
         pm.setDevicePixelRatio(dpr)   # 恢复 DPR，贴图显示尺寸不变
         return pm
+
+    def _draw_trans_text(self, p: QPainter, rect: QRect, fg: QColor, trans: str, h0: int):
+        """译文逐行显式排版：行进距 = 字高 + 间隙，任何机器/字体上都不重叠。
+
+        旧实现一次 drawText 交由字体自身 lineSpacing 摆行：YaHei 部分字号
+        leading≤0（行距≤字高），不重叠全凭字形没画满 em 框；字体解析不同的
+        机器上行带直接相接，看起来就是重叠。现在行位置自己算，几何上保证间隙。
+
+        纯像素字号（pointSize 受系统 DPI 影响，译文整体偏大约 1/3）：
+        先按原行高给值，逐 px 缩到行数×行进距严格放得下。
+        """
+        w = max(8, rect.width())
+        size = max(8, int(round(h0 * 0.75)))
+        while True:
+            f = QFont(_tr_family())
+            f.setPixelSize(size)
+            p.setFont(f)
+            fm = p.fontMetrics()          # 度量取画笔所在设备，与实际绘制严格同源
+            advance = fm.height() + max(1, size // 8)
+            lines = self._wrap_lines(trans, f, w)
+            if size <= 8 or len(lines) * advance <= rect.height():
+                break
+            size -= 1
+        p.setPen(QPen(fg, 1))
+        # 极小框缩到下限仍放不下时：只画放得下的整行，宁缺不压行（不再半截字）
+        p.setClipRect(rect)
+        y = rect.top()
+        for ln in lines:
+            if y + fm.height() > rect.bottom() + 1:
+                break
+            p.drawText(QRect(rect.left(), y, w, fm.height()),
+                       Qt.AlignLeft | Qt.AlignTop, ln)
+            y += advance
+        p.setClipping(False)
+
+    @staticmethod
+    def _wrap_lines(text: str, font: QFont, w: int) -> list:
+        """与 TextWordWrap 同款断行规则（QTextLayout），返回每行字符串。"""
+        tl = QTextLayout(text, font)
+        opt = tl.textOption()
+        opt.setWrapMode(QTextOption.WrapMode.WordWrap)
+        tl.setTextOption(opt)
+        out = []
+        tl.beginLayout()
+        while True:
+            ln = tl.createLine()
+            if not ln.isValid():
+                break
+            ln.setLineWidth(w)
+            out.append(text[ln.textStart():ln.textStart() + ln.textLength()])
+        tl.endLayout()
+        return out
 
     @staticmethod
     def _sample_bg(img: QImage, box: QRect) -> QColor:
@@ -728,7 +787,66 @@ if __name__ == "__main__":
         assert out.width() == 300 and out.height() == 120, "设备像素尺寸不应改变"
         assert (out.devicePixelRatio() or 1.0) == dpr, "DPR 应原样恢复"
         pw.close_me()
-    print("pinwin 自测: 翻译字号/DPR OK，继续翻译守卫与译文选字…")
+    print("pinwin 自测: 翻译字号/DPR OK，继续译文行距硬保证…")
+
+    # ---- 译文行距硬保证：逐行显式排版后墨迹带之间必有间隙（换机重叠的回归）
+    # 机器上字体解析各不相同，这里直接校验渲染结果的墨迹几何：
+    # 多行译文的相邻墨迹带之间必须至少有 1px 空隙，行带相接/合并即失败。
+    def _ink_gaps(img, box):
+        bands, cur = [], None
+        for y in range(box.top(), box.bottom() + 1):
+            ink = any(img.pixelColor(x, y).lightness() < 200
+                      for x in range(box.left(), box.right() + 1))
+            if ink and cur is None:
+                cur = [y, y]
+            elif ink:
+                cur[1] = y
+            elif cur is not None:
+                bands.append(tuple(cur))
+                cur = None
+        if cur is not None:
+            bands.append(tuple(cur))
+        return [bands[i + 1][0] - bands[i][1] - 1 for i in range(len(bands) - 1)]
+
+    pw = PinWindow(_make_pix(1.0), QPoint(30, 30), config.load(), None, None)
+    # 窄块 + 长译文 → 多行换行；块高足够 → 至少两行
+    dense_blocks = [{"rect": QRect(20, 20, 120, 44), "text": "Original", "h": 44}]
+    out = pw._build_replaced(dense_blocks,
+                             ["这是一段比较长的中文翻译需要换行才能放下测试行距"])
+    out.setDevicePixelRatio(1.0)
+    gaps = _ink_gaps(out.toImage(), QRect(18, 18, 124, 48))
+    assert len(gaps) >= 1, f"窄块长译文应换出多行，实际墨迹带 {gaps}"
+    assert min(gaps) >= 1, f"译文行带相接/重叠: {gaps}"
+    print(f"pinwin 自测: 译文行距硬保证 OK（行带间隙 {gaps}），继续两遍绘制回归…")
+
+    # ---- 两遍绘制回归：紧凑双块（下块底色矩形会盖住上块译文尾部）不再互相擦字
+    # 构造：A 块高、译文换出 4 行，末行墨迹压进 B 块的深红底色矩形。
+    # A 原文黑色 → 译文近黑(max<100)；B 红底白字 → 填充红(max=150)、译文白(max=255)。
+    # 旧的单块顺序下 B 的红色矩形会擦掉 A 的末行墨迹，近黑像素消失即回归失败。
+    pix2 = QPixmap(300, 160)
+    pix2.fill(Qt.white)
+    p2 = QPainter(pix2)
+    p2.setPen(QPen(Qt.black, 1))
+    p2.setFont(QFont("Microsoft YaHei", 10))
+    p2.drawText(QRect(20, 40, 120, 20), Qt.AlignLeft | Qt.AlignVCenter, "First line text")
+    p2.fillRect(15, 60, 135, 30, QColor(150, 30, 30))
+    p2.setPen(QPen(Qt.white, 1))
+    p2.drawText(QRect(20, 66, 120, 12), Qt.AlignLeft | Qt.AlignVCenter, "Second line")
+    p2.end()
+    pw2 = PinWindow(pix2, QPoint(30, 30), config.load(), None, None)
+    tight = [{"rect": QRect(20, 18, 120, 72), "text": "First line text", "h": 72},
+             {"rect": QRect(20, 64, 120, 16), "text": "Second line", "h": 16}]
+    out2 = pw2._build_replaced(
+        tight,
+        ["这是一段比较长的中文翻译需要换行显示完整测试多行排列效果",
+         "第二行译文"])
+    out2.setDevicePixelRatio(1.0)
+    img2 = out2.toImage()
+    tail = [img2.pixelColor(x, y) for x in range(20, 115) for y in range(71, 80)]
+    assert any(max(c.red(), c.green(), c.blue()) < 100 for c in tail), \
+        "下块铺底色不应擦掉上块译文（两遍绘制回归失败）"
+    pw2.close_me()
+    print("pinwin 自测: 两遍绘制 OK，继续翻译守卫与译文选字…")
 
     # ---- 翻译守卫：OCR 未完成不静默失败(自动重试)；在途请求去重
     from PySide6.QtCore import QObject, Signal as _Signal
