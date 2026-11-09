@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 运行产物
+snappin.log
+*.log
+
+# 打包产物
+build/
+dist/
+*.spec.bak
+
+# 本地临时
+*.tmp
+.DS_Store
