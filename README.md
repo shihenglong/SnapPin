@@ -12,6 +12,18 @@ Python + PySide6 实现的 PixPin 核心功能复刻：**截图 / 贴图 / OCR �
 - 仅支持 Windows 10/11 x64。
 - 应用内置**自动检查更新**（GitHub Releases），也可在 设置 → 关于 手动检查。
 
+## 界面预览
+
+| 截图与标注（选区工具栏 / 箭头 / 尺寸提示） | 贴图取字（OCR 高亮，选中字符即复制） |
+|---|---|
+| ![截图与标注](docs/img/capture.png) | ![贴图取字](docs/img/pin_ocr.png) |
+| **右键翻译：译文直接替换原图文字** | **剪贴板历史（Ditto 式快贴，点哪行粘哪行）** |
+| ![翻译替换](docs/img/pin_translate.png) | ![剪贴板历史](docs/img/clip_history.png) |
+
+设置窗口（8 页导航 · 应用/确定/取消 统一提交 · 关于页可检查更新）：
+
+![设置窗口](docs/img/settings.png)
+
 ## 从源码运行
 
 ```bash
