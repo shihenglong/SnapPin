@@ -255,10 +255,14 @@ class SettingsDialog(QDialog):
         self.nav.setCurrentRow(0)
 
     def show_up(self):
-        """非模态显示/激活（App 单例复用入口）。"""
+        """非模态显示/激活（App 单例复用入口）。
+
+        托盘菜单/单实例二启路径没有前台权限，activateWindow 会被 Windows
+        静默拒绝而沉底——winfront.force_front 抬升并核实。
+        """
         self.show()
-        self.raise_()
-        self.activateWindow()
+        import winfront
+        winfront.force_front(self)
 
     # ================================================== 页面骨架
     def _page(self, *cards):

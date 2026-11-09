@@ -181,11 +181,15 @@ class PwmanWindow(QDialog):
 
     # ------------------------------------------------ 显示 / 关闭
     def show_up(self):
-        """刷新表格并显示/激活窗口（外部复用入口）。"""
+        """刷新表格并显示/激活窗口（外部复用入口）。
+
+        托盘菜单路径无前台权限，activateWindow 会被静默拒绝而沉底——同设置窗
+        用 winfront.force_front 抬升并核实。
+        """
         self.refresh()
         self.show()
-        self.raise_()
-        self.activateWindow()
+        import winfront
+        winfront.force_front(self)
 
     def closeEvent(self, ev):
         """关闭时仅隐藏，窗口保留以便复用。"""
