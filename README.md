@@ -140,6 +140,18 @@ SNAPPIN_DEBUG=1 python main.py > snappin.log 2>&1
 - **设置窗口**：左侧导航（通用/截图/贴图/剪贴板/密码管理/翻译/快捷键/关于），
   底部「应用 / 确定 / 取消」统一提交，直接关闭窗口 = 丢弃改动。
 
+## 发布（维护者）
+
+```bash
+python -m PyInstaller --noconfirm snappin.spec        # 构建 exe
+python tools/make_release_zip.py                       # 标准版 zip
+python tools/make_release_zip.py --full                # full 版 zip（内置离线翻译）
+python tools/publish_release.py --version 0.6.0 \
+       --notes build/release_notes_v0.6.0.md dist/*.zip   # 建 Release + 传资产
+```
+
+发布脚本的令牌取自 git 凭据（能 push 就能发），支持断点续传与大文件重试。
+
 ## 目录结构
 
 ```
