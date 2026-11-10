@@ -393,6 +393,70 @@ def shot_clip():
         pass
 
 
+# ================================================================ 6. 长截图预览窗
+def shot_longshot_preview():
+    """长截图右侧预览窗：长图缩略图 + 自动滚动 / 完成 / 取消。"""
+    from capture import LongshotPreview
+    pm = QPixmap(232, 520)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.TextAntialiasing)
+    p.fillRect(pm.rect(), QColor("#FFFFFF"))
+    p.setPen(QColor("#1D2129"))
+    p.setFont(QFont("Microsoft YaHei UI", 12, QFont.Bold))
+    p.drawText(16, 30, "滚动拼接中的长图")
+    p.setPen(QColor("#86909C"))
+    p.setFont(QFont("Segoe UI", 8))
+    p.drawText(16, 46, "live preview · scroll stitching")
+    p.setPen(QColor("#4E5969"))
+    p.setFont(QFont("Segoe UI", 8))
+    for i, t in enumerate(("选区固定，向上下双向拼接，", "回滚不重复，停止后预览更新", "", "自动滚动：程序定速下滚，", "拼好一段才滚下一段", "", "固定悬浮件自动消除，", "正文零涂抹、零重影")):
+        p.drawText(16, 76 + i * 16, t)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor("#F5F6F7"))
+    p.drawRoundedRect(16, 226, 200, 54, 6, 6)
+    p.setPen(QColor("#A272D6"))
+    p.setFont(QFont("Consolas", 8))
+    p.drawText(26, 248, "$ snappin --longshot")
+    p.drawText(26, 266, "  stitch 60 rows / frame")
+    p.setBrush(QColor("#E8F3FF"))
+    p.drawRoundedRect(16, 296, 200, 76, 6, 6)
+    p.setPen(QColor("#1D2129"))
+    p.setFont(QFont("Segoe UI", 8))
+    for i in range(6):
+        p.drawText(26, 314 + i * 12, "· stitched line " * 2)
+    p.end()
+    pv = LongshotPreview()
+    pv.set_pix(pm)
+    app.processEvents()
+    save(flatten(pv.grab(), "#FFFFFF"), "longshot.png")
+    pv.close()
+
+
+# ================================================================ 7. GIF 录制结果
+def shot_gif_result():
+    """GIF 录制结果：钉在桌面的预览窗（播放遮罩 + 保存/复制/关闭）。"""
+    import numpy as np
+    from capture import CaptureOverlay, GifResult
+    W, H = 320, 210
+    frames = []
+    for i in range(10):
+        yy, xx = np.mgrid[0:H, 0:W]
+        r = (xx * 255 // W).astype(np.uint8)
+        g = (yy * 255 // H).astype(np.uint8)
+        b = ((i * 26 + xx) % 256).astype(np.uint8)
+        f = np.stack([r, g, b], axis=2)
+        f[36:92, 18:92] = np.array([255, 59, 48], np.uint8)
+        f[104:160, 150:236] = np.array([52, 199, 89], np.uint8)
+        f[120:168, 40:140] = np.array([10, 132, 255], np.uint8)
+        frames.append(f)
+    path = os.path.join(TMP, "readme_demo.gif")
+    CaptureOverlay._encode_gif(frames, path)
+    res = GifResult(path, QPoint(40, 40), frames)
+    app.processEvents()
+    save(flatten(res.grab(), "#FFFFFF"), "gif_record.png")
+    res.close()
+
+
 # ================================================================ 5. 设置窗口
 def shot_settings():
     from settings_ui import SettingsDialog
@@ -414,6 +478,10 @@ if __name__ == "__main__":
             shot_pin_translate(make_pin("local"))
     print("== 4/5 剪贴板历史 ==")
     shot_clip()
-    print("== 5/5 设置窗口 ==")
+    print("== 5/7 设置窗口 ==")
     shot_settings()
+    print("== 6/7 长截图预览 ==")
+    shot_longshot_preview()
+    print("== 7/7 GIF 录制结果 ==")
+    shot_gif_result()
     print("done ->", OUT)
