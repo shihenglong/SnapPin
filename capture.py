@@ -12,9 +12,10 @@ from PySide6.QtGui import (QBrush, QColor, QCursor, QFont, QIcon, QImage,
                            QRegion,
                            QKeySequence, QPainter, QPainterPath, QPen, QPixmap,
                            QShortcut)
-from PySide6.QtWidgets import (QApplication, QGridLayout, QHBoxLayout, QLabel,
-                               QPushButton, QTextEdit, QToolButton, QVBoxLayout,
-                               QWidget, QGraphicsDropShadowEffect)
+from PySide6.QtWidgets import (QApplication, QFileDialog, QGridLayout, QHBoxLayout,
+                               QLabel, QMessageBox, QPushButton, QTextEdit,
+                               QToolButton, QVBoxLayout, QWidget,
+                               QGraphicsDropShadowEffect)
 
 from icons import icon
 
@@ -140,8 +141,8 @@ class LongshotPreview(QWidget):
         self.on_finish = None
         self.on_cancel = None
         col = QVBoxLayout(self)
-        col.setContentsMargins(2, 2, 2, 2)
-        col.setSpacing(4)
+        col.setContentsMargins(6, 6, 6, 6)
+        col.setSpacing(5)
         self.lab = QLabel("在选区内滚动页面，\n开始拼接长图…")
         self.lab.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
         self.lab.setMinimumHeight(40)
@@ -154,29 +155,39 @@ class LongshotPreview(QWidget):
         self.status.hide()
         col.addWidget(self.status)
         btns = QHBoxLayout()
-        btns.setSpacing(6)
-        btn_ok = QPushButton("完成 (Enter)")
-        btn_cancel = QPushButton("取消 (Esc)")
+        btns.setSpacing(8)
+        btn_ok = QPushButton("完成")
+        btn_cancel = QPushButton("取消")
         for b in (btn_ok, btn_cancel):
-            b.setFixedHeight(24)
+            b.setFixedHeight(28)
             b.setCursor(Qt.PointingHandCursor)
-        btn_ok.setStyleSheet("QPushButton{background:#2E7CF6;color:white;border:none;"
-                             "border-radius:4px;}QPushButton:hover{background:#1E66E0;}")
-        btn_cancel.setStyleSheet("QPushButton{background:#F2F3F5;color:#4E5969;border:none;"
-                                 "border-radius:4px;}QPushButton:hover{background:#E5E6EB;}")
+            b.setFocusPolicy(Qt.NoFocus)
+        btn_ok.setToolTip("完成并复制到剪贴板 (Enter)")
+        btn_cancel.setToolTip("取消长截图 (Esc)")
+        btn_ok.setStyleSheet(
+            "QPushButton{background:#2E7CF6;color:#FFFFFF;border:none;"
+            "border-radius:7px;font-size:12px;font-weight:600;}"
+            "QPushButton:hover{background:#1E66E0;}"
+            "QPushButton:pressed{background:#1857C4;}")
+        btn_cancel.setStyleSheet(
+            "QPushButton{background:#2B3038;color:#C9CDD4;border:1px solid #3A4049;"
+            "border-radius:7px;font-size:12px;}"
+            "QPushButton:hover{background:#363C46;color:#FFFFFF;}"
+            "QPushButton:pressed{background:#242930;}")
         btn_ok.clicked.connect(lambda: self.on_finish and self.on_finish())
         btn_cancel.clicked.connect(lambda: self.on_cancel and self.on_cancel())
         btns.addWidget(btn_ok)
         btns.addWidget(btn_cancel)
         col.addLayout(btns)
         self.setStyleSheet(
-            "LongshotPreview{background:#2E7CF6;border-radius:4px;}")
-        self.setFixedWidth(192)
+            "LongshotPreview{background:#1E2126;border:2px solid #2E7CF6;"
+            "border-radius:9px;}")
+        self.setFixedWidth(196)
         self._apply_height(60)
 
     def _apply_height(self, content_h: int):
         """按预览内容高度调整窗口高度，并夹在当前屏幕内。"""
-        total = content_h + 50                     # 边距2*2 + 间距4*2 + 状态14 + 按钮行24 + 余量
+        total = content_h + 62                     # 边距6*2 + 间距5*2 + 状态14 + 按钮行28 + 余量
         scr = self.screen() or QApplication.primaryScreen()
         max_h = scr.availableGeometry().height() - 24 if scr else total
         self.setFixedHeight(max(96, min(total, max_h)))
@@ -255,12 +266,13 @@ class CaptureOverlay(QWidget):
         self._ls_stitched = None
         self._ls_buf = None
         self._ls_len = 0
+        self._ls_off = 0          # 长图首行在 _ls_buf 中的偏移（支持头部前插）
+        self._ls_view = 0         # 参考帧视口顶部在长图中的行坐标（去重唯一事实）
         self._ls_cap = 0
+        self._ls_full = False
         self._ls_ref_gray = None
-        self._ls_fixed_hint = None
         self._ls_preview_h = 0
         self._ls_preview_t = 0.0
-        self._ls_scheduled = False
         self._preview = None
 
         self._tip = QLabel(self)
@@ -614,8 +626,14 @@ class CaptureOverlay(QWidget):
 
     # ------------------------------------------------ 工具动作
     def _on_tool_action(self, name):
-        if getattr(self, "_longshot", False) and name != "close":
-            return  # 长截图进行中工具栏其余动作一律忽略（复制/保存会误关覆盖层）
+        if getattr(self, "_longshot", False):
+            if name == "save":
+                self._save_longshot()      # 长截图另存为：选位置 → 保存 → 关闭
+            elif name == "pin":
+                self._pin_longshot()       # 长图直接钉到桌面（自动缩放适配屏幕）
+            elif name == "close":
+                self._cancel()
+            return
         if name.startswith("color:"):
             self._color = name.split(":", 1)[1]
             self._cfg.setdefault("capture", {})["last_color"] = self._color
@@ -819,28 +837,62 @@ class CaptureOverlay(QWidget):
         self._longshot = True
         self._tool = None
         self.toolbar.highlight_tool("longshot")
-        # 真实透明洞：选区镂空，底层窗口直接可见、可直接滚轮滚动
-        hole = QRegion(self._sel)
-        self.setMask(QRegion(self.rect()) - hole)
-        self._ls_prev, self._ls_prev_gray = self._grab_region()
-        # 预分配拼接缓冲：逐帧 vstack 全量拷贝是长图越拼越卡的元凶，改为倍增扩容
-        w3 = max(1, self._ls_prev.shape[1] * 3)
-        self._ls_cap = max(1000, min(40000, 150 * 1024 * 1024 // w3))  # 彩色按字节量封顶
-        H0, W0 = self._ls_prev.shape[:2]
-        self._ls_buf = np.empty((min(self._ls_cap, max(H0 * 2, 256)), W0, 3), np.uint8)
-        self._ls_buf[:H0] = self._ls_prev
-        self._ls_len = H0
-        self._ls_stitched = self._ls_buf[:H0]
-        self._ls_ref_gray = self._ls_prev_gray   # 拼接参考帧：只在拼接成功时前进
-        self._ls_fixed_hint = None               # 移动阶段留下的悬浮件消除提示
-        self._ls_preview_h = 0
-        self._ls_preview_t = 0.0
+        self._ls_reset_state()
         self._make_preview()
-        self._ls_timer = QTimer(self, interval=150)   # 快滚时单拍位移更小、易落栅格
-        self._ls_timer.timeout.connect(self._ls_step)
+        # 长截图期间整个覆盖层镂空，只留选区边框和工具栏：
+        # 选区外也恢复实时桌面（不再顶着进入长截图时的暗化快照），
+        # 滚动页面时四周不会出现“背景被钉死”的割裂感；框选本身固定不动。
+        ring = QRegion(self._sel.adjusted(-4, -4, 4, 4)) - QRegion(self._sel)
+        ring += QRegion(self.toolbar.geometry())
+        self.setMask(ring)
+        if getattr(self, "_ls_timer", None) is None:
+            self._ls_timer = QTimer(self, interval=150)   # 快滚时单拍位移更小、易落栅格
+            self._ls_timer.timeout.connect(self._ls_step)
         self._ls_timer.start()
+        # setMask 是异步窗口系统操作：立即抓首帧会抓到覆盖层自己的暗化画面，
+        # 之后所有对齐都拿这张脏参考帧当基准 → 用户实测「完全拼不上」。
+        # 延后到镂空真正上屏后的稳定帧再取首帧。用有 parent 的定时器，
+        # 覆盖层被 WA_DeleteOnClose 销毁后不会回调到已删除对象。
+        if getattr(self, "_ls_start_timer", None) is None:
+            self._ls_start_timer = QTimer(self)
+            self._ls_start_timer.setSingleShot(True)
+            self._ls_start_timer.timeout.connect(self._ls_begin)
+        self._ls_start_timer.start(100)
         self.activateWindow()
         self.setFocus()
+
+    def _ls_reset_state(self):
+        self._ls_prev = None
+        self._ls_prev_gray = None
+        self._ls_ref_gray = None
+        self._ls_stitched = None
+        self._ls_buf = None
+        self._ls_len = 0
+        self._ls_off = 0
+        self._ls_view = 0
+        self._ls_cap = 0
+        self._ls_full = False
+        self._ls_preview_h = 0
+        self._ls_preview_t = 0.0
+
+    def _ls_begin(self):
+        """首帧抓取：由 _enter_longshot 延迟触发，确保镂空已上屏。"""
+        if not self._longshot or self._ls_stitched is not None:
+            return
+        prev, prev_gray = self._grab_region()
+        # 预分配拼接缓冲：逐帧 vstack 全量拷贝是长图越拼越卡的元凶，改为倍增扩容
+        w3 = max(1, prev.shape[1] * 3)
+        self._ls_cap = max(1000, min(40000, 150 * 1024 * 1024 // w3))  # 彩色按字节量封顶
+        H0, W0 = prev.shape[:2]
+        self._ls_buf = np.empty((min(self._ls_cap, max(H0 * 2, 256)), W0, 3), np.uint8)
+        self._ls_buf[:H0] = prev
+        self._ls_off = 0
+        self._ls_len = H0
+        self._ls_stitched = self._ls_buf[:H0]
+        self._ls_prev, self._ls_prev_gray = prev, prev_gray
+        self._ls_ref_gray = prev_gray
+        self._ls_view = 0
+        self._update_preview(force=True)
 
     def _grab_region(self):
         """只抓选区洞（开销随选区而非全屏）。返回 (彩色RGB, 灰度)：
@@ -869,14 +921,23 @@ class CaptureOverlay(QWidget):
     _OV_RATIO = 0.75       # 重叠区一致行占比门槛（容纳悬浮按钮/表情动画）
 
     @staticmethod
-    def _cols_of(W):
-        """采样列带：避开左右边缘（滚动条/窗框），中段均匀取 4 带。"""
-        margin = max(8, min(W // 5, 60))
-        span = max(1, W - 2 * margin)
-        band = max(12, span // 8)
-        starts = margin + span * np.arange(4) // 4
-        return np.unique(np.concatenate(
-            [np.arange(st, min(st + band, W - margin)) for st in starts]))
+    def _texture_cols(strip, cap=96):
+        """锚定条带内自适应挑有纹理的列。固定采中段在「内容只占画面一侧」
+        （侧栏/聊天气泡/窄栏文档）时全部落在空白上，整帧永远锚定不上。
+        返回列索引（可能为空=条带内找不到可用列）。"""
+        sd = strip.std(axis=0)
+        edge = max(8, min(strip.shape[1] // 20, 24))   # 右侧滚动条会动，不参与
+        if strip.shape[1] > 2 * edge:
+            sd = sd.copy()
+            sd[:2] = 0.0
+            sd[-edge:] = 0.0
+        mx = float(sd.max())
+        if mx < 1.0:
+            return np.zeros(0, dtype=int)
+        idx = np.flatnonzero(sd >= max(2.0, mx * 0.2))
+        if idx.size > cap:
+            idx = idx[np.linspace(0, idx.size - 1, cap).astype(int)]
+        return idx
 
     @staticmethod
     def _pick_strip(gray, r0=0):
@@ -892,49 +953,80 @@ class CaptureOverlay(QWidget):
         return None
 
     @staticmethod
-    def _locate_block(block, hay, cols, cap=48):
+    def _locate_block(block, hay, cols, cap=48, tol=2):
         """在 hay 里找与 block 逐像素一致（采样列，±2）的全部位置（最多 cap 个）。
         平滑渐变类内容在 ±2 容差下相邻位置也会命中，必须收集齐全交给重叠
         验证逐个裁决，不能只取首个。"""
         K = block.shape[0]
+        if len(cols) == 0:
+            return []
         hits = []
         for p0 in range(hay.shape[0] - K + 1):
-            if np.abs(hay[p0:p0 + K, cols] - block[:, cols]).max() <= 2:
+            if np.abs(hay[p0:p0 + K, cols] - block[:, cols]).max() <= tol:
                 hits.append(p0)
                 if len(hits) >= cap:
                     break
         return hits
 
     @staticmethod
-    def _overlap_ratio(a, b, dy, cols):
-        """验证位移 dy：a[:ov] 与 b[dy:H] 逐行一致（±2，采样列）的行占比。"""
+    def _overlap_ratio(a, b, dy, cols, tol=2):
+        """验证位移 dy：只统计有内容（行内有纹理或与相邻行不同）的行，
+        并剔除悬浮固定件在两侧遮挡的行——空白行的“一致”不提供证据，
+        固定件的遮挡也不是错位。"""
         H = a.shape[0]
         ov = H - dy
-        if ov <= 0:
+        if ov <= 1 or len(cols) == 0:
             return 0.0
-        eq = (np.abs(a[:ov, cols] - b[dy:H, cols]) <= 2).all(axis=1)
-        return float(eq.mean())
+        rows = a[:ov, cols]
+        sd = rows.std(axis=1)                                   # 行内纹理
+        vd = np.abs(np.diff(rows, axis=0)).max(axis=1)          # 与下一行差异
+        textured = np.zeros(ov, dtype=bool)
+        textured[:-1] = vd > 1.0
+        textured |= sd > 2.0
+        diff = np.abs(rows - b[dy:dy + ov, cols]).max(axis=1)
+        # 悬浮固定件（吸顶/吸底按钮）在 cur/ref 同位置逐像素相同、却与
+        # 各自错开 dy 的自身不同；它不属于滚动内容。cur 侧会直接出现在
+        # 重叠区，ref 侧会“顶替”重叠区里本该是内容的行，两侧都必须剔除，
+        # 否则几十行按钮就能把正确位移的占比压到门槛以下。
+        same_pos = (a == b).all(axis=1)
+        if dy < H:
+            moved_a = (a[dy:] != a[:H - dy]).any(axis=1)
+            moved_b = (b[dy:] != b[:H - dy]).any(axis=1)
+            cur_fixed = same_pos.copy()
+            cur_fixed[:dy] = False
+            cur_fixed[dy:] &= moved_a
+            ref_fixed = same_pos.copy()
+            ref_fixed[:dy] = False
+            ref_fixed[dy:] &= moved_b
+        else:
+            cur_fixed = ref_fixed = np.zeros(H, dtype=bool)
+        bad = cur_fixed[:ov] | ref_fixed[dy:dy + ov]
+        textured &= ~bad
+        n = int(textured.sum())
+        if n < 4:                                               # 内容太少无从取证
+            return 0.0
+        return float((diff[textured] <= tol).mean())
 
     @classmethod
-    def _down_align(cls, ref, cur, max_shift=1600):
+    def _down_align(cls, ref, cur, max_shift=1600, min_ratio=None, locate_tol=2):
         """下滚对齐：cur 顶部纹理条带在 ref 中定位，dy=位置差=滚动位移；
         多命中逐个做重叠验证取最优，多条带重试（顶部恰好均匀时向后换带）。
         返回 (dy, 验证占比)；失败 (0, 0)。"""
-        H, W = cur.shape
+        H = cur.shape[0]
         if ref.shape[0] != H or H < 80:
             return 0, 0.0
         maxs = min(max_shift, H - 60)          # 至少留 60 行重叠可验证
-        cols = cls._cols_of(W)
         best = (0, 0.0)
         r0 = 0
-        while True:
+        for _ in range(8):                     # 失败路径限次：顶部固定栏再长也够换带
             picked = cls._pick_strip(cur, r0)
             if picked is None:
                 break                          # 整帧再也找不到纹理条带
             r0, strip = picked
             if r0 + cls._STRIP > H - 60:
                 break                          # 条带已深入可能的“新增内容”区
-            for p0 in cls._locate_block(strip, ref, cols):
+            cols = cls._texture_cols(strip)    # 内容只占一侧时也能锚定
+            for p0 in cls._locate_block(strip, ref, cols, tol=locate_tol):
                 dy = p0 - r0
                 if 1 <= dy <= maxs:
                     ratio = cls._overlap_ratio(cur, ref, dy, cols)
@@ -943,28 +1035,30 @@ class CaptureOverlay(QWidget):
                         if ratio >= 0.999:     # 整段重叠逐像素一致：无需更优
                             return best
             r0 += cls._STRIP                 # 本条带验证不过：换下一块
-        return best if best[1] >= cls._OV_RATIO else (0, 0.0)
+        gate = cls._OV_RATIO if min_ratio is None else min_ratio
+        return best if best[1] >= gate else (0, 0.0)
 
     @classmethod
-    def _up_align(cls, cur, ref, max_shift=1600):
+    def _up_align(cls, cur, ref, max_shift=1600, min_ratio=None, locate_tol=2):
         """上滚对齐（对称）：ref 顶部纹理条带在 cur 中定位，δ=位置差=上滚量。
-        ref[r]=cur[r+δ]，即 cur 内容在 ref 上方 δ 行 → 长图应裁尾 δ。
+        ref[r]=cur[r+δ]，即 cur 内容在 ref 上方 δ 行 → 视口顶部在长图里
+        上移 δ（由 _ls_place 决定裁尾/前插，已捕获行不动）。
         返回 (δ, 验证占比)；失败 (0, 0)。"""
-        H, W = cur.shape
+        H = cur.shape[0]
         if ref.shape[0] != H or H < 80:
             return 0, 0.0
         maxs = min(max_shift, H - 60)
-        cols = cls._cols_of(W)
         best = (0, 0.0)
         r0 = 0
-        while True:
+        for _ in range(8):
             picked = cls._pick_strip(ref, r0)
             if picked is None:
                 break
             r0, strip = picked
             if r0 + cls._STRIP > H - 60:
                 break
-            for p0 in cls._locate_block(strip, cur, cols):
+            cols = cls._texture_cols(strip)
+            for p0 in cls._locate_block(strip, cur, cols, tol=locate_tol):
                 delta = p0 - r0
                 if 1 <= delta <= maxs:
                     ratio = cls._overlap_ratio(ref, cur, delta, cols)
@@ -973,114 +1067,174 @@ class CaptureOverlay(QWidget):
                         if ratio >= 0.999:
                             return best
             r0 += cls._STRIP
-        return best if best[1] >= cls._OV_RATIO else (0, 0.0)
+        gate = cls._OV_RATIO if min_ratio is None else min_ratio
+        return best if best[1] >= gate else (0, 0.0)
 
     def _ls_step(self):
-        if not self._longshot:
+        if not self._longshot or self._ls_stitched is None or self._ls_full:
             return
         cur, cur_gray = self._grab_region()   # 选区是透明洞，抓到实时画面
         prev_gray = self._ls_prev_gray
         ref_gray = self._ls_ref_gray
-        if cur_gray.shape != ref_gray.shape:
+        if prev_gray is None or cur_gray.shape != ref_gray.shape:
             self._ls_prev, self._ls_prev_gray = cur, cur_gray
             return
-        settled = prev_gray is not None and prev_gray.shape == cur_gray.shape and \
-            float(np.abs(cur_gray[::4, ::4] - prev_gray[::4, ::4]).mean()) < 0.3
-        moved = float(np.abs(cur_gray[::4, ::4] - ref_gray[::4, ::4]).mean()) >= 0.3
-        if settled:
-            # PixPin 式节奏「停下来才合并」：页面停住后与参考帧对齐，快滚攒下
-            # 的位移一次补齐；对不齐就继续等，绝不硬拼。悬浮件掩码沿用移动
-            # 阶段留下的提示——此时 cur==prev，现算会把所有纹理行误判为悬浮件。
-            if moved:
-                self._ls_align(cur, cur_gray, self._ls_fixed_hint)
-        elif moved:
-            # 滚动中：可对齐才动（离散快滚实时成段）；平滑滚动动画帧锚定不上
-            # 就直接不算——宁丢勿糊，等沉降帧兜底
-            self._ls_align(cur, cur_gray, self._static_fixed(cur_gray, prev_gray))
+        # 只认“真正停住”的帧：连续两帧逐像素完全一致（0.05% 采样点容差
+        # 留给光标闪烁）。移动中的帧即使条带能对上，视口其他区域可能仍在
+        # 平滑滚动/流式渲染，拼进长图就是用户反复看到的横向拖影。宁丢勿糊。
+        d_prev = np.abs(cur_gray[::2, ::2] - prev_gray[::2, ::2])
+        d_ref = np.abs(cur_gray[::2, ::2] - ref_gray[::2, ::2])
+        settled = float((d_prev > 0).mean()) < 0.0005
+        moved = float((d_ref > 2).mean()) >= 0.002
+        if settled and moved:
+            self._ls_align(cur, cur_gray)
         if os.environ.get('SNAPPIN_DEBUG'):
-            print('LS_STEP settled=', settled, flush=True)
+            print('LS_STEP settled=', settled, 'len=', self._ls_len, flush=True)
         self._ls_prev, self._ls_prev_gray = cur, cur_gray
 
-    def _ls_align(self, cur, cur_gray, stamp_fixed):
-        """当前帧 vs 参考帧的双向锚定对齐：向下滚拼尾带，向上滚裁尾回退
-        （长图跟着视口缩回，再下滚重拼同一位置，来回滚动零重复）。
-        两方向都命中时按验证占比仲裁——真位移的整段一致证据必然压过歧义。"""
+    def _ls_align(self, cur, cur_gray):
+        """当前帧 vs 参考帧的双向锚定对齐：向下滚视口顶下移 dy，向上滚上移
+        delta。所有写入都以「视口顶部在长图中的坐标」为唯一事实——已捕获
+        的行永不覆盖，只在长图头/尾之外扩展，因此上滚、下滚、来回滚动都
+        不会重复。两方向都命中时按验证占比仲裁。
+        只在沉降帧调用：锚定条带必须逐像素精确命中（tol=0），重叠区再做
+        常规验证（±2 容忍悬浮件遮挡）。"""
         ref_gray = self._ls_ref_gray
-        d_s, d_r = self._down_align(ref_gray, cur_gray)
-        u_s, u_r = self._up_align(cur_gray, ref_gray)
-        if d_r >= u_r:                        # 平手归向下：不无端缩回已拼内容
-            if d_s >= 1:
-                self._ls_commit(cur, cur_gray, d_s, stamp_fixed)
-                return
+        gate, ltol = 0.9, 0
+        d_s, d_r = self._down_align(ref_gray, cur_gray, min_ratio=gate, locate_tol=ltol)
+        u_s, u_r = self._up_align(cur_gray, ref_gray, min_ratio=gate, locate_tol=ltol)
+        if d_s >= 1 and (u_s < 1 or d_r >= u_r):   # 平手归向下：不无端改向
+            top = self._ls_view + d_s
+            shift = d_s
         elif u_s >= 1:
-            self._ls_trim(u_s, cur_gray)
+            top = self._ls_view - u_s
+            shift = -u_s
+        else:
             return
-        if stamp_fixed is not None:
-            self._ls_fixed_hint = stamp_fixed  # 给沉降合并的悬浮件消除提示
-
-    def _ls_commit(self, cur, cur_gray, dy, fixed):
-        """拼接确认：悬浮固定件消除 → 尾带入缓冲 → 前进参考帧 → 刷新预览。"""
-        H = cur.shape[0]
-        cur_out = cur
-        if fixed is not None and fixed.any():
-            # 悬浮固定件（回到底部↓/吸顶栏等）钉在视口不动，直接拼会沿长图
-            # 重复盖章：填充消除后拼接，并同步擦掉首帧落在拼接图头部的盖章
-            cur_out = self._fill_static(cur.copy(), fixed)
-            if self._ls_len >= H and self._ls_buf is not None \
-                    and self._ls_buf.shape[1] == cur.shape[1]:
-                self._fill_static(self._ls_buf[:H], fixed)
-        self._ls_append(cur_out[H - dy:])
-        self._update_preview()
-        self._ls_ref_gray = cur_gray          # 只有拼接成功才前进参考帧
-
-    def _ls_trim(self, delta, cur_gray):
-        """向上滚动回退：裁掉长图尾部 delta 行（参考帧内容=缓冲尾 H 行的
-        不变式保持成立），参考帧换成当前帧——视口回到已拼接区，再下滚时
-        重拼的是同一位置内容，来回滚动不会重复（用户实测去重缺陷的修复）。
-        已到起点（上滚超出已捕获范围）时不裁不动，等滚回范围再续。"""
         H = cur_gray.shape[0]
-        if delta > self._ls_len - H:
-            return                            # 视口已高于捕获起点：等待回滚
-        self._ls_len -= delta
-        self._ls_stitched = self._ls_buf[:self._ls_len]
-        self._ls_ref_gray = cur_gray
-        self._update_preview(force=True)      # 长图变短，预览立即跟随
+        fixed = np.zeros(H, dtype=bool)
+        if abs(shift) >= 16:
+            # 位移小于固定件最小高度时，固定件不可能进入本次新行（新增行
+            # 只在视口最边缘），不检测也不填充；否则小位移下的纯色块会
+            # 被整行误判并抹成拉丝（用户实测拖影）。
+            fixed = self._static_fixed(cur_gray, ref_gray, shift)
+        if shift > 0:                       # 只消除会进入本次新尾行的固定件
+            fixed[:H - shift] = False
+        else:                               # 只消除会进入本次新头行的固定件
+            fixed[H + shift:] = False
+        cur_out = cur
+        if fixed.any():
+            # 悬浮固定件（回到底部↓/吸顶栏等）钉在视口不动，直接拼会沿长图
+            # 重复盖章：填充消除后再写入。已捕获行不动，只处理本帧新内容。
+            cur_out = self._fill_static(cur.copy(), fixed)
+        self._ls_place(top, cur_out, cur_gray)
+
+    def _ls_place(self, top, cur, cur_gray):
+        """把视口内容放到长图坐标 top 处：只补头/尾尚未捕获的行，中间已有
+        行一律不改写（去重的唯一出口）。超出 150MB 折算容量后冻结。"""
+        H = cur.shape[0]
+        want = max(self._ls_len, top + H) - min(0, top)
+        if want > self._ls_cap:
+            self._ls_full = True
+            return
+        if top < 0:                           # 向上滚出长图头部：前插新内容
+            self._ls_prepend(cur[:-top])
+            top = 0
+        end = top + H
+        if end > self._ls_len:                # 向下滚出长图尾部：追加新内容
+            self._ls_append(cur[H - (end - self._ls_len):])
+        self._ls_view = top
+        self._ls_ref_gray = cur_gray          # 只有定位确认才前进参考帧
+        self._update_preview()
+
+    def _ls_prepend(self, rows):
+        """长图头部前插（向上滚动的新内容）。头部预留不足时重排并居中，
+        保证之后上下两方向都有扩展余量；写入量为 O(新增行)。"""
+        n = int(rows.shape[0])
+        if n <= 0:
+            return
+        if self._ls_off < n:
+            total = min(self._ls_cap,
+                        max((self._ls_len + n) * 2,
+                            self._ls_len + n + max(n, 1024)))
+            off = min(max(n, total // 4), total - self._ls_len)
+            buf = np.empty((total, self._ls_buf.shape[1], 3), np.uint8)
+            buf[off:off + self._ls_len] = \
+                self._ls_buf[self._ls_off:self._ls_off + self._ls_len]
+            self._ls_buf, self._ls_off = buf, off
+        self._ls_off -= n
+        self._ls_buf[self._ls_off:self._ls_off + n] = rows
+        self._ls_len += n
+        self._ls_stitched = self._ls_buf[self._ls_off:self._ls_off + self._ls_len]
 
     def _ls_append(self, band):
-        """新增行写入预分配缓冲（倍增扩容）；超出按 150MB 折算行数截断，
-        保头部丢弃溢出——与旧 vstack 切断语义一致，但不再每帧全量拷贝。"""
-        if self._ls_len >= self._ls_cap:
+        """尾部追加（向下滚动的新内容）。预分配缓冲按需倍增扩容，
+        超出 150MB 折算行数后冻结，不再每帧全量拷贝。"""
+        if self._ls_stitched is None:
             return
-        rows = self._ls_buf.shape[0]
-        need = self._ls_len + band.shape[0]
-        if need > rows:
-            new_rows = min(self._ls_cap, max(rows * 2, need))
-            buf = np.empty((new_rows, self._ls_buf.shape[1], 3), np.uint8)
-            buf[:self._ls_len] = self._ls_buf[:self._ls_len]
-            self._ls_buf = buf
-        stop = min(need, self._ls_cap)
-        self._ls_buf[self._ls_len:stop] = band[:stop - self._ls_len]
-        self._ls_len = stop
-        self._ls_stitched = self._ls_buf[:self._ls_len]
+        n = int(band.shape[0])
+        if n <= 0:
+            return
+        if self._ls_len + n > self._ls_cap:
+            n = self._ls_cap - self._ls_len
+            if n <= 0:
+                self._ls_full = True
+                return
+            band = band[:n]
+            self._ls_full = True
+        need = self._ls_off + self._ls_len + n
+        if need > self._ls_buf.shape[0]:
+            total = min(self._ls_cap, max(self._ls_buf.shape[0] * 2, need))
+            off = min(self._ls_off, max(0, total - self._ls_len - n))
+            buf = np.empty((total, self._ls_buf.shape[1], 3), np.uint8)
+            buf[off:off + self._ls_len] = \
+                self._ls_buf[self._ls_off:self._ls_off + self._ls_len]
+            self._ls_buf, self._ls_off = buf, off
+        self._ls_buf[self._ls_off + self._ls_len:
+                     self._ls_off + self._ls_len + n] = band
+        self._ls_len += n
+        self._ls_stitched = self._ls_buf[self._ls_off:self._ls_off + self._ls_len]
 
     @staticmethod
-    def _static_fixed(cur_gray, prev_gray):
-        """检测悬浮固定件（回到底部↓/吸顶栏）：与上一帧同位置几乎完全一致
-        且自身有纹理的行。慢滚时静止的空白行同样“一致”，必须用纹理度排除，
-        否则整帧被判成悬浮件、消除逻辑把文字行也涂掉。"""
-        if cur_gray.shape != prev_gray.shape:
-            return np.zeros(cur_gray.shape[0], dtype=bool)
-        same = (np.abs(cur_gray[:, ::2] - prev_gray[:, ::2]) <= 2).mean(axis=1)
+    def _static_fixed(cur_gray, ref_gray, shift):
+        """检测悬浮固定件（回到底部↓/吸顶栏）。判据必须同时满足：
+        1) 与参考帧同位置逐像素完全一致——固定件钉在视口；
+        2) 与参考帧的滚动对应位置不一致——滚动内容会随位移移动。
+        只看 1) 会把滚动中的纯色块（粗体文字/卡片）整行判成固定件，再被
+        线性填充抹成竖向条纹，就是用户实测的拖影。固定件又只可能出现在
+        吸顶/吸底边缘，中间行一律不参与。占比过大说明整页没动，放弃。
+        shift>0 表示当前帧相对参考帧下移，<0 表示上移。"""
+        H = cur_gray.shape[0]
+        if cur_gray.shape != ref_gray.shape:
+            return np.zeros(H, dtype=bool)
+        same = (cur_gray[:, ::2] == ref_gray[:, ::2]).mean(axis=1)
         textured = cur_gray.std(axis=1) > 6.0
-        return (same > 0.92) & textured
+        edge = max(8, H // 5)
+        zone = np.zeros(H, dtype=bool)
+        zone[:edge] = True
+        zone[H - edge:] = True
+        fixed = (same > 0.999) & textured & zone
+        ov = H - abs(int(shift))
+        if shift > 0 and ov > 8:                  # 下滚：cur[:ov] 对应 ref[shift:]
+            fixed[:ov] &= (cur_gray[:ov, ::2] != ref_gray[shift:shift + ov, ::2]
+                           ).mean(axis=1) > 0.001
+        elif shift < 0 and ov > 8:                # 上滚：cur[-ov:] 对应 ref[:ov]
+            fixed[H - ov:] &= (cur_gray[H - ov:, ::2] != ref_gray[:ov, ::2]
+                               ).mean(axis=1) > 0.001
+        if fixed.any():                           # 固定件是连续元件：去掉孤立单行
+            cnt = np.convolve(fixed.astype(np.uint8), np.ones(3, np.uint8), "same")
+            fixed &= cnt >= 2
+        if fixed.sum() > H * 0.2:                 # 成片“静止”= 页面没动，不是固定件
+            return np.zeros(H, dtype=bool)
+        return fixed
 
     @staticmethod
     def _fill_static(img, mask):
         """把 fixed 行用上下最近正常行线性过渡填充（上下文多为纯背景，过渡即还原）。"""
         m = np.convolve(mask.astype(np.uint8), np.ones(5, np.uint8), "same") > 0  # ±2 行膨胀盖住抗锯齿边
         H = img.shape[0]
-        if not m.any() or m.sum() > H * 0.6:
-            return img                                   # 全帧静止/占比过大：保守不动
+        if not m.any() or m.sum() > H * 0.25:
+            return img                                   # 占比过大必是误判：保守不动
         d = np.diff(np.concatenate(([0], m.astype(np.int8), [0])))
         for r0, r1 in zip(np.where(d == 1)[0], np.where(d == -1)[0]):
             if r1 - r0 > H * 0.4:
@@ -1124,19 +1278,67 @@ class CaptureOverlay(QWidget):
         self._ls_preview_t = now
         c = self._ls_stitched
         h, w = c.shape[:2]
-        img = QImage(c.tobytes(), w, h, w * 3, QImage.Format_RGB888)
+        data = c.tobytes()        # 必须持有引用：QImage 不拥有内存，临时 bytes
+        img = QImage(data, w, h, w * 3, QImage.Format_RGB888)
         self._preview.set_pix(QPixmap.fromImage(img))
+
+    def _longshot_pixmap(self) -> QPixmap:
+        c = self._ls_stitched
+        h, w = c.shape[:2]
+        data = c.tobytes()        # 必须持有引用：QImage 不拥有内存
+        img = QImage(data, w, h, w * 3, QImage.Format_RGB888)
+        return QPixmap.fromImage(img)
 
     def _finish_longshot(self):
         if self._ls_stitched is None or self._ls_stitched.size == 0:
             self._exit_longshot()
             self.close()
             return
-        c = self._ls_stitched
-        h, w = c.shape[:2]
-        img = QImage(c.tobytes(), w, h, w * 3, QImage.Format_RGB888)
-        pix = QPixmap.fromImage(img)          # 彩色长图
+        pix = self._longshot_pixmap()
         QApplication.clipboard().setPixmap(pix)
+        try:                                  # 诊断用：保留原始长图 PNG，便于核对
+            path = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
+                                "SnapPin", "last_longshot.png")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            pix.save(path, "PNG")
+            print(f"LONGSHOT {pix.width()}x{pix.height()} -> {path}", flush=True)
+        except Exception as e:
+            print(f"LONGSHOT save failed: {e}", flush=True)
+        self._exit_longshot()
+        self.close()
+
+    def _pin_longshot(self):
+        """把当前长图钉到桌面：PinWindow 会按屏幕大小自动缩放，滚轮可再缩放。"""
+        if self._ls_stitched is None or self._ls_stitched.size == 0:
+            self._exit_longshot()
+            self.close()
+            return
+        pix = self._longshot_pixmap()
+        glob = self._sel.translated(self._origin)
+        self._exit_longshot()
+        self.sig_pin.emit(pix, glob)
+        self.close()
+
+    def _save_longshot(self):
+        """另存长截图：用户选位置后写文件，成功即退出并关闭截图。"""
+        if self._ls_stitched is None or self._ls_stitched.size == 0:
+            self._exit_longshot()
+            self.close()
+            return
+        pix = self._longshot_pixmap()
+        d = os.path.join(os.path.expanduser("~"), "Pictures", "SnapPin")
+        os.makedirs(d, exist_ok=True)
+        default = os.path.join(d, "长截图_" + time.strftime("%Y-%m-%d_%H%M%S") + ".png")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "保存长截图", default, "PNG 图片 (*.png);;JPEG 图片 (*.jpg)")
+        if not path:
+            return                            # 用户取消：留在长截图模式
+        if not os.path.splitext(path)[1]:
+            path += ".png"
+        if not pix.save(path):
+            QMessageBox.warning(self, "保存失败", f"无法写入：\n{path}")
+            return
+        self.sig_saved.emit(path)
         self._exit_longshot()
         self.close()
 
@@ -1145,6 +1347,8 @@ class CaptureOverlay(QWidget):
             self._longshot = False
             if getattr(self, "_ls_timer", None):
                 self._ls_timer.stop()
+            if getattr(self, "_ls_start_timer", None):
+                self._ls_start_timer.stop()
             self.clearMask()
             if self._preview:
                 # 先摘回调再关窗：防覆盖层销毁后预览窗按钮仍触发旧槽
@@ -1153,11 +1357,7 @@ class CaptureOverlay(QWidget):
                 self._preview.close()
                 self._preview = None
             # 释放拼接缓冲：长图可达百 MB 级，别等覆盖层销毁才回收
-            self._ls_buf = None
-            self._ls_stitched = None
-            self._ls_len = 0
-            self._ls_ref_gray = None
-            self._ls_fixed_hint = None
+            self._ls_reset_state()
 
     # ------------------------------------------------ 完成/导出
     def _compose(self) -> QPixmap:
@@ -1362,6 +1562,21 @@ if __name__ == "__main__":
 
     ov2._enter_longshot()                             # 进入长截图（含预览窗+定时器）
     assert ov2._preview is not None
+    # 长截图背景解锁：只留边框+工具栏，其余全部镂空（选区外实时桌面）
+    assert not ov2.mask().contains(ov2._sel.center()), "选区内必须镂空（实时滚动）"
+    assert not ov2.mask().contains(QPoint(2, 2)), "选区外背景必须镂空（背景解锁）"
+    assert ov2.mask().contains(ov2._sel.topLeft() - QPoint(1, 1)), "选区边框必须保留"
+    assert ov2.mask().contains(ov2._toolbar.geometry().center()), "工具栏必须保留"
+    saved = []
+    ov2._save_longshot = lambda: saved.append(1)
+    ov2._on_tool_action("save")
+    assert saved == [1], "长截图模式保存按钮必须触发另存为"
+    pinned = []
+    ov2.sig_pin.connect(lambda pix, r: pinned.append((pix.width(), r.width())))
+    ov2._ls_stitched = np.zeros((10, 20, 3), np.uint8)
+    ov2._on_tool_action("pin")
+    assert pinned == [(20, ov2._sel.width())] and ov2._longshot is False, \
+        "长截图模式贴图必须把长图钉出并退出长截图"
     ov2.close()                                       # 任意关闭路径 → 必须收尾
     assert ov2._longshot is False and ov2._preview is None, "close 必须关掉孤儿预览窗"
     assert not ov2._ls_timer.isActive(), "长截图定时器必须停止"
@@ -1391,7 +1606,7 @@ if __name__ == "__main__":
     cur = np.roll(prev, -10, axis=0).copy()
     cur[30:36] = prev[30:36]
     cur[90:96] = 245
-    fixed = CaptureOverlay._static_fixed(cur, prev)
+    fixed = CaptureOverlay._static_fixed(cur, prev, -10)
     assert fixed[30:36].all() and not fixed[90:96].any() and not fixed[100:110].any(), \
         "应识别按钮行；静止空白行与滚动正文行都不得误判"
     col = np.repeat(cur[:, :, None], 3, axis=2).astype(np.uint8)
@@ -1399,8 +1614,28 @@ if __name__ == "__main__":
     assert not (out[28:38] == 77).any(), "悬浮按钮应被填充消除"
     assert (out[5] == col[5]).all(), "正常内容行必须保持原样"
 
+    # 平滑滚动动画中间帧：同行内容“看起来接近”但并非逐像素静止，
+    # 绝不能整片判成固定件（填充即用户实测的横向拉丝拖影）
+    arng = np.random.default_rng(5)
+    page = arng.integers(0, 255, (H + 1, W), dtype=np.int16)
+    f0 = page[:H]
+    f1 = np.rint(0.6 * page[:H] + 0.4 * page[1:H + 1]).astype(np.int16)
+    assert not CaptureOverlay._static_fixed(f1, f0, 1).any(), \
+        "平滑滚动动画帧不得被判为悬浮固定件"
+    assert not CaptureOverlay._static_fixed(f0, f0, 0).any(), \
+        "整页静止时固定件掩码必须为空（成片静止=页面没动，不是固定件）"
+    # 滚动中的纯色块：同行像素在 ±1px 位移下相同，但滚动对应位置也相同，
+    # 属于内容而非固定件；只有块的边缘一行会“同位置不同滚动位”，须被连续段过滤
+    blk0 = np.full((H, W), 250, np.int16)
+    blk1 = np.full((H, W), 250, np.int16)
+    blk0[170:184, 20:120] = 40
+    blk1[171:185, 20:120] = 40
+    assert not CaptureOverlay._static_fixed(blk1, blk0, 1).any(), \
+        "滚动中的纯色块不得被判为悬浮固定件"
+
     # ---- 锚定条带对齐：慢滚 1px/大步长/动画帧拒绝/悬浮件容忍/大位移量程
-    prof = np.tile(np.arange(400, dtype=np.int16)[:, None], (1, 90))
+    prof = ((np.arange(400, dtype=np.int16)[:, None] * 7 +
+             np.arange(90, dtype=np.int16)[None, :] * 3) % 251).astype(np.int16)
     assert CaptureOverlay._down_align(prof, np.roll(prof, -1, axis=0))[0] == 1, \
         "慢速滚动 1px 也应被捕获"
     assert CaptureOverlay._down_align(prof, np.roll(prof, -300, axis=0))[0] == 300, \
@@ -1442,6 +1677,7 @@ if __name__ == "__main__":
     ov4 = CaptureOverlay(app.primaryScreen(), config.load())
     ov4._sel = QRect(40, 40, 300, 200)
     ov4._enter_longshot()
+    ov4._ls_begin()                                   # 首帧生产路径延迟 100ms，测试同步取
     H0 = ov4._ls_prev.shape[0]
     band = np.full((50, ov4._ls_prev.shape[1], 3), 200, np.uint8)
     for _ in range(6):
@@ -1466,6 +1702,7 @@ if __name__ == "__main__":
     ov5 = CaptureOverlay(app.primaryScreen(), config.load())
     ov5._sel = QRect(40, 40, 300, 200)
     ov5._enter_longshot()
+    ov5._ls_begin()
     H0 = ov5._ls_prev.shape[0]
     ov5._ls_cap = H0 + 120
     for _ in range(4):
@@ -1480,10 +1717,12 @@ if __name__ == "__main__":
         "退出应释放拼接缓冲并停止定时器"
 
     # ---- 多拍流程（长文档切片构造，np.roll 的环形回绕会伪造反向命中）：
-    # 动画帧拒绝不丢内容，沉降后按真实位移补齐；上滚裁尾、来回滚零重复
+    # 动画帧拒绝不丢内容，沉降后按真实位移补齐；上滚只回退视口不重拼、
+    # 下滚回来零重复（已捕获行永不改写/重复追加）
     ov6 = CaptureOverlay(app.primaryScreen(), config.load())
     ov6._sel = QRect(40, 40, 300, 200)
     ov6._enter_longshot()
+    ov6._ls_begin()
     H6, W6 = ov6._ls_prev.shape[:2]
     doc = rng.integers(0, 255, (H6 + 3000, W6), dtype=np.int16)
     frame_at = lambda p: doc[p:p + H6]
@@ -1505,7 +1744,8 @@ if __name__ == "__main__":
     n0 = ov6._ls_len
     for name, frame in seq:
         holder["frame"] = frame
-        ov6._ls_step()
+        ov6._ls_step()                 # 滚动中：不拼
+        ov6._ls_step()                 # 停住：沉降帧才拼
     assert ov6._ls_len == n0 + 110, f"序列终态应累计 +110, 实际 +{ov6._ls_len - n0}"
     assert (ov6._ls_ref_gray == frame_at(110)).all(), "参考帧应前进到 E"
 
@@ -1515,16 +1755,22 @@ if __name__ == "__main__":
     assert (np.abs(stitched - expect).mean(axis=1) <= 2).all(), \
         "拼接区必须逐行等于源文档（零错位零重复）"
 
-    # ---- 上滚回退(用户实测去重缺陷)：上滚 85 裁尾，下滚 45 重拼同一位置
-    for name, frame, want_len in (("U", frame_at(25), n0 + 25),
-                                  ("D2", frame_at(70), n0 + 70),
-                                  ("U", frame_at(25), n0 + 25),
-                                  ("D2", frame_at(70), n0 + 70),
-                                  ("U", frame_at(25), n0 + 25),
-                                  ("D2", frame_at(70), n0 + 70)):
+    # ---- 上滚回退(用户实测去重缺陷)：上滚 85 只回退视口，下滚 45 回到
+    # 已捕获区，长图不缩不重复——长度恒定、内容逐行不变
+    settled_len = ov6._ls_len
+    for name, frame, want_view in (("U", frame_at(25), 25),
+                                   ("D2", frame_at(70), 70),
+                                   ("U", frame_at(25), 25),
+                                   ("D2", frame_at(70), 70),
+                                   ("U", frame_at(25), 25),
+                                   ("D2", frame_at(70), 70)):
         holder["frame"] = frame
-        ov6._ls_step()
-        assert ov6._ls_len == want_len, f"{name} 拍后长度应为 +{want_len - n0}, 实际 +{ov6._ls_len - n0}"
+        ov6._ls_step()                 # 滚动中：上滚不处理（防插值帧污染参考）
+        ov6._ls_step()                 # 停住：沉降帧处理回退/前插
+        assert ov6._ls_len == settled_len, \
+            f"{name} 拍后长图不得缩短/重复, 应为 {settled_len}, 实际 {ov6._ls_len}"
+        assert ov6._ls_view == want_view, \
+            f"{name} 拍后视口顶部应回到长图行 {want_view}, 实际 {ov6._ls_view}"
     stitched2 = ov6._ls_stitched[H6:].astype(np.int16)[:, :, 1]
     expect2 = doc[H6:H6 + (ov6._ls_len - H6)]
     assert (np.abs(stitched2 - expect2).mean(axis=1) <= 2).all(), \
@@ -1533,5 +1779,41 @@ if __name__ == "__main__":
     ov6._exit_longshot()
     assert ov6._ls_stitched is None and ov6._ls_ref_gray is None, \
         "退出应同时释放参考帧"
+
+    # ---- 上滚扩展（用户要求）：从文档中间进入，上滚把上方新内容前插到
+    # 长图头部，下滚回原位置不重复，再下滚继续追加；双向都按真实文档坐标
+    ov7 = CaptureOverlay(app.primaryScreen(), config.load())
+    ov7._sel = QRect(40, 40, 300, 200)
+    ov7._enter_longshot()
+    ov7._ls_begin()
+    H7, W7 = ov7._ls_prev.shape[:2]
+    doc7 = rng.integers(0, 255, (H7 + 6000, W7), dtype=np.int16)
+    at7 = lambda p: doc7[p:p + H7]
+    ov7._ls_buf[:H7] = np.repeat(at7(500)[:, :, None], 3, axis=2)  # 长图头 = 文档 500
+    ov7._ls_stitched = ov7._ls_buf[:H7]
+    ov7._ls_ref_gray = at7(500).copy()
+    holder7 = {"frame": at7(500)}
+    ov7._grab_region = lambda: (np.stack([holder7["frame"].astype(np.uint8)] * 3, axis=2),
+                                holder7["frame"].copy())
+
+    def shot7(p, want_len, want_view):
+        holder7["frame"] = at7(p)
+        ov7._ls_step()                 # 滚动中
+        ov7._ls_step()                 # 停住（上滚只在沉降帧处理）
+        assert ov7._ls_len == want_len, f"位置 {p}: 长图应 {want_len} 行, 实际 {ov7._ls_len}"
+        assert ov7._ls_view == want_view, f"位置 {p}: 视口应在长图 {want_view}, 实际 {ov7._ls_view}"
+
+    shot7(400, H7 + 100, 0)        # 上滚 100：头部前插未捕获内容
+    shot7(360, H7 + 140, 0)        # 再上滚 40：继续前插
+    shot7(460, H7 + 140, 100)      # 下滚回已捕获区：不重复追加
+    shot7(560, H7 + 200, 200)      # 继续下滚：尾部追加 60
+    shot7(660, H7 + 300, 300)      # 再下滚：尾部追加 100
+    shot7(560, H7 + 300, 200)      # 来回滚：不缩不重复
+    shot7(660, H7 + 300, 300)
+    final7 = ov7._ls_stitched.astype(np.int16)[:, :, 1]
+    expect7 = doc7[360:360 + ov7._ls_len]
+    assert (np.abs(final7 - expect7).mean(axis=1) <= 2).all(), \
+        "上下滚扩展后长图必须逐行等于文档（零错位零重复）"
+    ov7._exit_longshot()
     print("capture 自测通过: 惰性马赛克/工具栏/预暗化绘制/长截图守卫收尾/彩色拼接/"
           "悬浮件纹理判定/锚定条带对齐/仿微信回归/上下滚去重/缓冲扩容截断/预览防抖 全部 OK")
