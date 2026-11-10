@@ -525,6 +525,11 @@ class CaptureOverlay(QWidget):
         self._gif_full = False
         self._gif_size = None               # 统一帧尺寸（超内存预算时等比缩小）
         self._gif_cursor = None
+        self._gif_clicks = []               # (x, y, t)：点击水波纹
+        self._gif_lbtn = False
+        self._gif_hook = None
+        self._gif_hook_cb = None
+        self._gif_click_events = []         # 全局钩子捕获的 (gx, gy, t)
         self._gif_result = None
         self._gif_max_frames = 300          # 30s @ 10fps
         self._gif_max_bytes = 400 * 1024 * 1024
@@ -1109,6 +1114,10 @@ class CaptureOverlay(QWidget):
         self._gif_frames = []
         self._gif_full = False
         self._gif_size = None
+        self._gif_clicks = []
+        self._gif_click_events = []
+        self._gif_lbtn = bool(user32.GetAsyncKeyState(0x01) & 0x8000)
+        self._gif_install_hook()
         self._gif_t0 = time.monotonic()
         self._make_gif_cursor()
         self._make_gif_bar()
@@ -1148,6 +1157,54 @@ class CaptureOverlay(QWidget):
         self._gif_timer.start()
         self._gif_tick()
 
+    def _gif_install_hook(self):
+        """低级鼠标钩子：10fps 轮询会漏掉快速点击，钩子能可靠拿到按下事件。"""
+        if self._gif_hook:
+            return
+        try:
+            from ctypes import WINFUNCTYPE
+            HOOKPROC = WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int,
+                                   wintypes.WPARAM, wintypes.LPARAM)
+            user32.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC,
+                                                 ctypes.c_void_p, wintypes.DWORD]
+            user32.SetWindowsHookExW.restype = ctypes.c_void_p
+            user32.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                              wintypes.WPARAM, wintypes.LPARAM]
+            user32.CallNextHookEx.restype = ctypes.c_ssize_t
+            user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+
+            def _cb(code, wparam, lparam):
+                if code >= 0 and wparam == 0x0201:      # WM_LBUTTONDOWN
+                    pt = wintypes.POINT()
+                    user32.GetCursorPos(ctypes.byref(pt))
+                    self._gif_click_events.append((pt.x, pt.y, time.monotonic()))
+                return user32.CallNextHookEx(None, code, wparam, lparam)
+
+            self._gif_hook_cb = HOOKPROC(_cb)
+            self._gif_hook = user32.SetWindowsHookExW(14, self._gif_hook_cb, None, 0) or None
+        except Exception:
+            self._gif_hook = None
+
+    def _gif_remove_hook(self):
+        if self._gif_hook:
+            try:
+                user32.UnhookWindowsHookEx(ctypes.c_void_p(self._gif_hook))
+            except Exception:
+                pass
+            self._gif_hook = None
+        self._gif_hook_cb = None
+
+    def _gif_local(self, gx, gy, orig_h, orig_w):
+        """屏幕坐标 → 录制帧坐标（裁 2px + 等比缩放）。"""
+        g = self._sel.translated(self._origin)
+        mx = int((gx - g.x()) * self._dpr) - 2
+        my = int((gy - g.y()) * self._dpr) - 2
+        if self._gif_size:
+            h0, w0 = max(1, orig_h - 4), max(1, orig_w - 4)
+            mx = int(mx * self._gif_size[0] / w0)
+            my = int(my * self._gif_size[1] / h0)
+        return mx, my
+
     def _make_gif_cursor(self):
         """缓存一个带白边的黑色箭头，录制时叠加到鼠标位置。"""
         pm = QPixmap(26, 32)
@@ -1167,13 +1224,26 @@ class CaptureOverlay(QWidget):
         p.setBrush(QColor("#000000"))
         p.drawPath(path)
         p.end()
-        self._gif_cursor = pm
+        self._gif_cursor = pm.scaled(21, 26, Qt.KeepAspectRatio,
+                                     Qt.SmoothTransformation)
 
-    def _draw_gif_cursor(self, frame, x, y):
+    def _draw_gif_overlay(self, frame, mx, my, now):
+        """叠加点击水波纹（点击后约 0.45s 扩散淡出）与鼠标指针。"""
         h, w = frame.shape[:2]
         img = QImage(frame.data, w, h, w * 3, QImage.Format_RGB888)
         p = QPainter(img)
-        p.drawPixmap(x - 1, y - 1, self._gif_cursor)
+        p.setRenderHint(QPainter.Antialiasing)
+        for x, y, t in self._gif_clicks:
+            prog = (now - t) / 0.45
+            if 0.0 <= prog <= 1.0:
+                alpha = int(210 * (1.0 - prog))
+                p.setBrush(Qt.NoBrush)
+                p.setPen(QPen(QColor(255, 255, 255, alpha), 2))
+                p.drawEllipse(QPoint(x, y), int(6 + 24 * prog), int(6 + 24 * prog))
+                p.setPen(QPen(QColor(46, 124, 246, alpha // 2), 2))
+                r2 = int(3 + 15 * prog)
+                p.drawEllipse(QPoint(x, y), r2, r2)
+        p.drawPixmap(mx - 1, my - 1, self._gif_cursor)
         p.end()
 
     def _prepare_gif_frame(self, cur):
@@ -1197,16 +1267,22 @@ class CaptureOverlay(QWidget):
         orig_h, orig_w = cur.shape[:2]
         cur = self._prepare_gif_frame(cur)
         pos = QCursor.pos()
-        g = self._sel.translated(self._origin)
-        mx = int((pos.x() - g.x()) * self._dpr) - 2
-        my = int((pos.y() - g.y()) * self._dpr) - 2
-        if self._gif_size:
-            h0, w0 = max(1, orig_h - 4), max(1, orig_w - 4)
-            mx = int(mx * self._gif_size[0] / w0)
-            my = int(my * self._gif_size[1] / h0)
-        if 0 <= mx < cur.shape[1] and 0 <= my < cur.shape[0]:
-            self._draw_gif_cursor(cur, mx, my)
+        mx, my = self._gif_local(pos.x(), pos.y(), orig_h, orig_w)
+        now = time.monotonic()
+        for gx, gy, t in self._gif_click_events:
+            cx, cy = self._gif_local(gx, gy, orig_h, orig_w)
+            if 0 <= cx < cur.shape[1] and 0 <= cy < cur.shape[0]:
+                self._gif_clicks.append((cx, cy, t))
+        self._gif_click_events.clear()
+        if not self._gif_hook:                 # 钩子不可用才退回按键边沿轮询
+            down = bool(user32.GetAsyncKeyState(0x01) & 0x8000)
+            if down and not self._gif_lbtn and 0 <= mx < cur.shape[1] and 0 <= my < cur.shape[0]:
+                self._gif_clicks.append((mx, my, now))
+            self._gif_lbtn = down
+        self._gif_clicks = [c for c in self._gif_clicks if now - c[2] < 0.5]
         h, w = cur.shape[:2]
+        if 0 <= mx < w and 0 <= my < h:
+            self._draw_gif_overlay(cur, mx, my, now)
         n = len(self._gif_frames)
         if n >= self._gif_max_frames or (n + 1) * h * w * 3 > self._gif_max_bytes:
             self._gif_full = True
@@ -1288,6 +1364,7 @@ class CaptureOverlay(QWidget):
                 self._gif_bar.on_cancel = None
                 self._gif_bar.close()
                 self._gif_bar = None
+            self._gif_remove_hook()
             self._gif_frames = []
             self._gif_full = False
             self._gif_size = None
@@ -2287,9 +2364,12 @@ if __name__ == "__main__":
     assert not ov8.mask().contains(ov8._sel.center()), "GIF 录制选区必须镂空"
     assert not ov8.mask().contains(QPoint(2, 2)), "GIF 录制背景必须解锁"
     assert ov8._gif_cursor is not None, "录制应缓存鼠标指针"
+    assert ov8._gif_cursor.width() == 21, "鼠标指针应缩小到 21px 宽"
     cframe = np.zeros((60, 80, 3), np.uint8)
-    ov8._draw_gif_cursor(cframe, 10, 10)
-    assert cframe.any(), "鼠标指针应绘制到帧上"
+    ov8._gif_clicks = [(30, 30, time.monotonic())]
+    ov8._draw_gif_overlay(cframe, 10, 10, time.monotonic())
+    assert cframe.any(), "鼠标指针/点击水波纹应绘制到帧上"
+    ov8._gif_clicks = []
     ov8._grab_region = lambda: (np.full((90, 120, 3), 180, np.uint8),
                                 np.zeros((90, 120), np.int16))
     ov8._gif_begin()
