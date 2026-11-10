@@ -256,6 +256,7 @@ class CaptureOverlay(QWidget):
         self._ls_len = 0
         self._ls_cap = 0
         self._ls_ref_gray = None
+        self._ls_fixed_hint = None
         self._ls_preview_h = 0
         self._ls_scheduled = False
         self._preview = None
@@ -829,9 +830,10 @@ class CaptureOverlay(QWidget):
         self._ls_len = H0
         self._ls_stitched = self._ls_buf[:H0]
         self._ls_ref_gray = self._ls_prev_gray   # 拼接参考帧：只在拼接成功时前进
+        self._ls_fixed_hint = None               # 移动阶段留下的悬浮固定件行提示
         self._ls_preview_h = 0
         self._make_preview()
-        self._ls_timer = QTimer(self, interval=300)
+        self._ls_timer = QTimer(self, interval=150)   # 快滚时单拍位移更小、易落栅格
         self._ls_timer.timeout.connect(self._ls_step)
         self._ls_timer.start()
         self.activateWindow()
@@ -853,20 +855,9 @@ class CaptureOverlay(QWidget):
         return color, np.ascontiguousarray(arr[:, :, 1].astype(np.int16))
 
     @staticmethod
-    def _find_dy(ref, cur, fixed=None, max_shift=900):
-        """沉降帧精确对齐（参考 ShareX ScrollingCaptureManager.CombineImages 的
-        「重叠区实心一致行」思路）：行均值投影只负责粗排候选，真正判定靠
-        「从重叠区底边向上数连续逐像素一致行」（±2 容差，悬浮固定件行通配），
-        实心一致行不足的候选一律拒绝。
-
-        平滑滚动的动画中间帧（分数像素位置渲染）凑不出实心一致行，天然被拒；
-        参考帧只在拼接成功时前进，动画沉降后按真实位移一帧补齐——文字重影
-        与模糊由此消除。返回滚动位移 dy（0 = 本帧不拼接）。"""
-        H, W = cur.shape
-        if ref.shape[0] != H or H < 80:
-            return 0
-        if float(ref.std()) < 2.0:
-            return 0                       # 近匀质画面投影无处对齐，防随机错配
+    def _projection_candidates(ref, cur, max_shift=1600, n=8):
+        """行均值投影粗排：返回差异最小的 n 个互不相邻(>3px)候选，升序。"""
+        H = cur.shape[0]
         maxs = min(max_shift, H - 60)
         pp = ref.mean(axis=1, dtype=np.float32)
         cp = cur.mean(axis=1, dtype=np.float32)
@@ -878,9 +869,26 @@ class CaptureOverlay(QWidget):
         for s in order:
             if all(abs(int(s) - c0) > 3 for c0 in cand):
                 cand.append(int(s))
-            if len(cand) >= 8:
+            if len(cand) >= n:
                 break
-        cand.sort()                        # 同分时小位移优先（少拼内容更安全）
+        return sorted(cand), maxs
+
+    @staticmethod
+    def _find_dy(ref, cur, fixed=None, max_shift=1600):
+        """沉降帧精确对齐（参考 ShareX ScrollingCaptureManager.CombineImages 的
+        「重叠区实心一致行」思路）：投影只负责粗排候选，判定靠「从重叠区底边
+        向上数连续逐像素一致行」（±2 容差，悬浮固定件行通配），实心一致行不足
+        的候选一律拒绝——平滑滚动的动画中间帧（分数像素位置渲染）凑不出实心
+        一致行，天然被拒，文字重影与模糊由此消除。
+
+        量程放宽到 1600px 且阈值随重叠区缩放：快速滚动（拍间隔内位移大）时
+        重叠变小也能命中。返回滚动位移 dy（0 = 本帧走近似兜底或不拼）。"""
+        H, W = cur.shape
+        if ref.shape[0] != H or H < 80:
+            return 0
+        if float(ref.std()) < 2.0:
+            return 0                       # 近匀质画面投影无处对齐，防随机错配
+        cand, _maxs = CaptureOverlay._projection_candidates(ref, cur, max_shift)
         # 采样列带：避开左右边缘（滚动条/窗框），中段均匀取 4 带
         margin = max(8, min(W // 5, 60))
         span = max(1, W - 2 * margin)
@@ -895,7 +903,7 @@ class CaptureOverlay(QWidget):
                 best_run, best_s = run, s
                 if run >= (H - s) * 3 // 4:    # 已证重叠区 3/4 实心一致，无需更优
                     break
-        if best_s < 1 or best_run < max(12, H // 8):
+        if best_s < 1 or best_run < max(10, (H - best_s) // 4):
             return 0
         return best_s
 
@@ -921,32 +929,48 @@ class CaptureOverlay(QWidget):
         cur, cur_gray = self._grab_region()   # 选区是透明洞，抓到实时画面
         prev_gray = self._ls_prev_gray
         ref_gray = self._ls_ref_gray
-        fixed = None
-        dy = 0
-        if cur_gray.shape == ref_gray.shape and \
-                float(np.abs(cur_gray[::4, ::4] - ref_gray[::4, ::4]).mean()) >= 0.3:
-            # 相对参考帧有位移才进匹配；动画中间帧凑不出实心一致行会被拒，
-            # 参考帧不前进，沉降后的帧按真实位移一次补齐（重影根因消除）
+        if cur_gray.shape != ref_gray.shape:
+            self._ls_prev, self._ls_prev_gray = cur, cur_gray
+            return
+        settled = prev_gray is not None and prev_gray.shape == cur_gray.shape and \
+            float(np.abs(cur_gray[::4, ::4] - prev_gray[::4, ::4]).mean()) < 0.3
+        if settled:
+            # PixPin 式节奏「停下来才合并」：页面停住后与参考帧实心对齐。
+            # 快滚攒下的位移在沉降帧上一次补齐；对不齐（位移超量程/内容变化）
+            # 就继续等，绝不硬拼。固定件掩码沿用移动阶段留下的提示——此时
+            # cur==prev，现算会退化成全帧通配，错放分数位移帧。
+            if float(np.abs(cur_gray[::4, ::4] - ref_gray[::4, ::4]).mean()) >= 0.3:
+                dy = self._find_dy(ref_gray, cur_gray, fixed=self._ls_fixed_hint)
+                if dy >= 1:
+                    self._ls_commit(cur, cur_gray, dy, self._ls_fixed_hint)
+        elif float(np.abs(cur_gray[::4, ::4] - ref_gray[::4, ::4]).mean()) >= 0.3:
+            # 滚动中：仅当与参考帧实心可拼才即时拼（离散跳变式快滚实时成段，
+            # 实心对齐保证无拖影）；平滑滚动的动画帧（分数像素位置）拼不了
+            # 就直接不算——宁丢勿糊，等沉降帧兜底
             fixed = self._static_fixed(cur_gray, prev_gray)
             dy = self._find_dy(ref_gray, cur_gray, fixed=fixed)
+            if dy >= 1:
+                self._ls_commit(cur, cur_gray, dy, fixed)
+            else:
+                self._ls_fixed_hint = fixed   # 给沉降合并的固定件提示
         if os.environ.get('SNAPPIN_DEBUG'):
-            diff = float((abs(cur_gray - ref_gray)).mean()) \
-                if cur_gray.shape == ref_gray.shape else -1
-            print('LS_STEP dy=', dy, 'diff=', round(diff, 2), flush=True)
-        if dy >= 1:
-            H = cur.shape[0]
-            cur_out = cur
-            if fixed is not None and fixed.any():
-                # 悬浮固定件（回到底部↓/吸顶栏等）钉在视口不动，直接拼会沿长图
-                # 重复盖章：填充消除后拼接，并同步擦掉首帧落在拼接图头部的盖章
-                cur_out = self._fill_static(cur.copy(), fixed)
-                if self._ls_len >= H and self._ls_buf is not None \
-                        and self._ls_buf.shape[1] == cur.shape[1]:
-                    self._fill_static(self._ls_buf[:H], fixed)
-            self._ls_append(cur_out[H - dy:])
-            self._update_preview()
-            self._ls_ref_gray = cur_gray      # 只有拼接成功才前进参考帧
+            print('LS_STEP settled=', settled, flush=True)
         self._ls_prev, self._ls_prev_gray = cur, cur_gray
+
+    def _ls_commit(self, cur, cur_gray, dy, fixed):
+        """拼接确认：悬浮固定件消除 → 尾带入缓冲 → 前进参考帧 → 刷新预览。"""
+        H = cur.shape[0]
+        cur_out = cur
+        if fixed is not None and fixed.any():
+            # 悬浮固定件（回到底部↓/吸顶栏等）钉在视口不动，直接拼会沿长图
+            # 重复盖章：填充消除后拼接，并同步擦掉首帧落在拼接图头部的盖章
+            cur_out = self._fill_static(cur.copy(), fixed)
+            if self._ls_len >= H and self._ls_buf is not None \
+                    and self._ls_buf.shape[1] == cur.shape[1]:
+                self._fill_static(self._ls_buf[:H], fixed)
+        self._ls_append(cur_out[H - dy:])
+        self._update_preview()
+        self._ls_ref_gray = cur_gray          # 只有拼接成功才前进参考帧
 
     def _ls_append(self, band):
         """新增行写入预分配缓冲（倍增扩容）；超出按 150MB 折算行数截断，
@@ -1011,11 +1035,11 @@ class CaptureOverlay(QWidget):
         tb.show()
 
     def _update_preview(self, force=False):
-        """节流：内容每长 ≥24 行才重渲染一次预览（全图缩放随长图越来越贵）。"""
+        """节流：内容每长 ≥12 行才重渲染一次预览（全图缩放随长图越来越贵）。"""
         if self._preview is None or self._ls_stitched is None:
             return
         if not force and self._ls_preview_h and \
-                self._ls_len - self._ls_preview_h < 24:
+                self._ls_len - self._ls_preview_h < 12:
             return
         self._ls_preview_h = self._ls_len
         c = self._ls_stitched
@@ -1053,6 +1077,7 @@ class CaptureOverlay(QWidget):
             self._ls_stitched = None
             self._ls_len = 0
             self._ls_ref_gray = None
+            self._ls_fixed_hint = None
 
     # ------------------------------------------------ 完成/导出
     def _compose(self) -> QPixmap:
@@ -1315,6 +1340,8 @@ if __name__ == "__main__":
     fx = np.zeros(400, bool); fx[375] = True
     assert CaptureOverlay._find_dy(tex, cur_fx, fixed=fx) == 20, \
         "固定件行作通配后应按真实位移拼接"
+    assert CaptureOverlay._find_dy(tex, np.roll(tex, -339, axis=0)) == 339, \
+        "快滚大位移应在 1600 量程内实心命中(重叠 61 行仍可判定)"
 
     # ---- 预分配拼接缓冲：倍增扩容/首帧保留/追加落位
     ov4 = CaptureOverlay(app.primaryScreen(), config.load())
@@ -1388,8 +1415,22 @@ if __name__ == "__main__":
     holder["frame"] = seq["D"]
     ov6._ls_step()                        # 再滚 30 行
     assert ov6._ls_len == n0 + 70, f"再次滚动应续拼 30 行, 实际 +{ov6._ls_len - n0 - 40}"
+    # PixPin 式「宁丢勿糊」：分数位移动画帧拼不了就直接不算，等沉降帧兜底
+    fracF = (np.roll(base, -90, axis=0) * 3 + np.roll(base, -91, axis=0)) // 4
+    holder["frame"] = fracF
+    ov6._ls_step()
+    assert ov6._ls_len == n0 + 70, "分数位移动画帧应直接丢弃(不硬拼防拖影)"
+    # 位移超量程的沉降帧：等待不硬拼；可对齐的帧一到立刻恢复续拼
+    far = np.roll(base, -(70 + H6), axis=0)
+    holder["frame"] = far
+    ov6._ls_step()                        # 第一拍：移动分支，超量程丢弃
+    ov6._ls_step()                        # 第二拍：settled，仍对不齐 → 继续等
+    assert ov6._ls_len == n0 + 70, "超量程沉降帧应等待而非硬拼"
+    holder["frame"] = np.roll(base, -110, axis=0)
+    ov6._ls_step()                        # 对齐恢复：D→+40
+    assert ov6._ls_len == n0 + 110, "可对齐帧到达应恢复续拼"
     ov6._exit_longshot()
     assert ov6._ls_stitched is None and ov6._ls_ref_gray is None, \
         "退出应同时释放参考帧"
     print("capture 自测通过: 惰性马赛克/工具栏/预暗化绘制/长截图守卫收尾/彩色拼接/"
-          "固定件消除/沉降帧对齐/参考帧持久化/缓冲扩容截断/预览节流 全部 OK")
+          "固定件消除/沉降帧对齐/PixPin式宁丢勿糊/缓冲扩容截断/预览节流 全部 OK")
