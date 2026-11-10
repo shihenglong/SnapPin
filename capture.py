@@ -882,12 +882,17 @@ class CaptureOverlay(QWidget):
         一致行，天然被拒，文字重影与模糊由此消除。
 
         量程放宽到 1600px 且阈值随重叠区缩放：快速滚动（拍间隔内位移大）时
-        重叠变小也能命中。返回滚动位移 dy（0 = 本帧走近似兜底或不拼）。"""
+        重叠变小也能命中。返回滚动位移 dy（0 = 本帧不拼接）。"""
+        return CaptureOverlay._find_dy2(ref, cur, fixed, max_shift)[0]
+
+    @staticmethod
+    def _find_dy2(ref, cur, fixed=None, max_shift=1600):
+        """> _find_dy，同时返回实心一致行数作为方向仲裁的证据强度。"""
         H, W = cur.shape
         if ref.shape[0] != H or H < 80:
-            return 0
+            return 0, 0
         if float(ref.std()) < 2.0:
-            return 0                       # 近匀质画面投影无处对齐，防随机错配
+            return 0, 0                    # 近匀质画面投影无处对齐，防随机错配
         cand, _maxs = CaptureOverlay._projection_candidates(ref, cur, max_shift)
         # 采样列带：避开左右边缘（滚动条/窗框），中段均匀取 4 带
         margin = max(8, min(W // 5, 60))
@@ -904,8 +909,8 @@ class CaptureOverlay(QWidget):
                 if run >= (H - s) * 3 // 4:    # 已证重叠区 3/4 实心一致，无需更优
                     break
         if best_s < 1 or best_run < max(10, (H - best_s) // 4):
-            return 0
-        return best_s
+            return 0, 0
+        return best_s, best_run
 
     @staticmethod
     def _match_run(cur, ref, dy, cols, fixed=None):
@@ -934,28 +939,40 @@ class CaptureOverlay(QWidget):
             return
         settled = prev_gray is not None and prev_gray.shape == cur_gray.shape and \
             float(np.abs(cur_gray[::4, ::4] - prev_gray[::4, ::4]).mean()) < 0.3
+        moved = float(np.abs(cur_gray[::4, ::4] - ref_gray[::4, ::4]).mean()) >= 0.3
         if settled:
             # PixPin 式节奏「停下来才合并」：页面停住后与参考帧实心对齐。
             # 快滚攒下的位移在沉降帧上一次补齐；对不齐（位移超量程/内容变化）
             # 就继续等，绝不硬拼。固定件掩码沿用移动阶段留下的提示——此时
             # cur==prev，现算会退化成全帧通配，错放分数位移帧。
-            if float(np.abs(cur_gray[::4, ::4] - ref_gray[::4, ::4]).mean()) >= 0.3:
-                dy = self._find_dy(ref_gray, cur_gray, fixed=self._ls_fixed_hint)
-                if dy >= 1:
-                    self._ls_commit(cur, cur_gray, dy, self._ls_fixed_hint)
-        elif float(np.abs(cur_gray[::4, ::4] - ref_gray[::4, ::4]).mean()) >= 0.3:
-            # 滚动中：仅当与参考帧实心可拼才即时拼（离散跳变式快滚实时成段，
-            # 实心对齐保证无拖影）；平滑滚动的动画帧（分数像素位置）拼不了
-            # 就直接不算——宁丢勿糊，等沉降帧兜底
-            fixed = self._static_fixed(cur_gray, prev_gray)
-            dy = self._find_dy(ref_gray, cur_gray, fixed=fixed)
-            if dy >= 1:
-                self._ls_commit(cur, cur_gray, dy, fixed)
-            else:
-                self._ls_fixed_hint = fixed   # 给沉降合并的固定件提示
+            if moved:
+                self._ls_align(cur, cur_gray, self._ls_fixed_hint)
+        elif moved:
+            # 滚动中：与参考帧实心可拼才动（离散跳变式快滚实时成段，实心对齐
+            # 保证无拖影）；平滑滚动的动画帧（分数像素位置）拼不了就直接不算
+            # ——宁丢勿糊，等沉降帧兜底
+            self._ls_align(cur, cur_gray, self._static_fixed(cur_gray, prev_gray))
         if os.environ.get('SNAPPIN_DEBUG'):
             print('LS_STEP settled=', settled, flush=True)
         self._ls_prev, self._ls_prev_gray = cur, cur_gray
+
+    def _ls_align(self, cur, cur_gray, fixed):
+        """当前帧 vs 参考帧的双向实心对齐：向下滚拼尾带，向上滚裁尾回退
+        （长图跟着视口缩回，再下滚重拼同一位置，来回滚动不产生重复）。
+        两个方向都可能在对齐成功的门槛内找到候选（均匀背景区易出假匹配），
+        按实心一致行数仲裁——真位移的整段实心证据必然压过假匹配。"""
+        ref_gray = self._ls_ref_gray
+        d_s, d_run = self._find_dy2(ref_gray, cur_gray, fixed=fixed)
+        u_s, u_run = self._find_dy2(cur_gray, ref_gray, fixed=fixed)
+        if d_run >= u_run:                    # 平手归向下：不无端缩回已拼内容
+            if d_s >= 1:
+                self._ls_commit(cur, cur_gray, d_s, fixed)
+                return
+        elif u_s >= 1:
+            self._ls_trim(u_s, cur_gray)
+            return
+        if fixed is not None:
+            self._ls_fixed_hint = fixed       # 给沉降合并的固定件提示
 
     def _ls_commit(self, cur, cur_gray, dy, fixed):
         """拼接确认：悬浮固定件消除 → 尾带入缓冲 → 前进参考帧 → 刷新预览。"""
@@ -971,6 +988,19 @@ class CaptureOverlay(QWidget):
         self._ls_append(cur_out[H - dy:])
         self._update_preview()
         self._ls_ref_gray = cur_gray          # 只有拼接成功才前进参考帧
+
+    def _ls_trim(self, delta, cur_gray):
+        """向上滚动回退：裁掉长图尾部 delta 行（参考帧内容=缓冲尾 H 行的
+        不变式保持成立），参考帧换成当前帧——视口回到已拼接区，再下滚时
+        重拼的是同一位置内容，来回滚动不会重复（用户实测去重缺陷的修复）。
+        已到起点（上滚超出已捕获范围）时不裁不动，等滚回范围再续。"""
+        H = cur_gray.shape[0]
+        if delta > self._ls_len - H:
+            return                            # 视口已高于捕获起点：等待回滚
+        self._ls_len -= delta
+        self._ls_stitched = self._ls_buf[:self._ls_len]
+        self._ls_ref_gray = cur_gray
+        self._update_preview(force=True)      # 长图变短，预览立即跟随
 
     def _ls_append(self, band):
         """新增行写入预分配缓冲（倍增扩容）；超出按 150MB 折算行数截断，
@@ -1407,11 +1437,12 @@ if __name__ == "__main__":
     assert ov6._ls_len == n0 + 40, f"沉降帧应一次补齐 40 行, 实际 +{ov6._ls_len - n0}"
     assert (ov6._ls_ref_gray == seq["B"]).all(), "拼接成功后参考帧应前进到 B"
     holder["frame"] = seq["C"]
-    ov6._ls_step()                        # 回滚：忽略
-    assert ov6._ls_len == n0 + 40, "向上回滚应被忽略"
+    ov6._ls_step()                        # 回滚 15：裁尾回退（新语义，不再忽略）
+    assert ov6._ls_len == n0 + 25 and (ov6._ls_ref_gray == seq["C"]).all(), \
+        "向上回滚应裁尾回退"
     holder["frame"] = seq["B"]
-    ov6._ls_step()                        # 与参考帧相同：静止快筛跳过
-    assert ov6._ls_len == n0 + 40, "与参考帧相同不应重复拼接"
+    ov6._ls_step()                        # 回到 40：重拼同一位置
+    assert ov6._ls_len == n0 + 40, "下滚重拼不得产生重复内容"
     holder["frame"] = seq["D"]
     ov6._ls_step()                        # 再滚 30 行
     assert ov6._ls_len == n0 + 70, f"再次滚动应续拼 30 行, 实际 +{ov6._ls_len - n0 - 40}"
@@ -1429,6 +1460,28 @@ if __name__ == "__main__":
     holder["frame"] = np.roll(base, -110, axis=0)
     ov6._ls_step()                        # 对齐恢复：D→+40
     assert ov6._ls_len == n0 + 110, "可对齐帧到达应恢复续拼"
+
+    # ---- 上滚回退(用户实测去重缺陷)：上滚 85 裁尾，下滚 45 重拼同一位置
+    U = np.roll(base, -25, axis=0)        # 视口 25，参考帧在 110 → 上滚 85
+    holder["frame"] = U
+    ov6._ls_step()
+    assert ov6._ls_len == n0 + 25 and (ov6._ls_ref_gray == U).all(), \
+        "上滚应裁掉长图尾部并前进参考帧，而非重复拼接"
+    D2 = np.roll(base, -70, axis=0)       # 下滚到 70：相对 U(25) 位移 45
+    holder["frame"] = D2
+    ov6._ls_step()
+    assert ov6._ls_len == n0 + 70 and (ov6._ls_ref_gray == D2).all(), \
+        "上滚后下滚应重拼同一位置"
+    snap = ov6._ls_stitched[H6:].copy()
+    for _ in range(3):                    # 反复上下滚：长度与内容必须纹丝不动
+        holder["frame"] = U
+        ov6._ls_step()
+        assert ov6._ls_len == n0 + 25, "上滚必须回退而非重复拼接"
+        holder["frame"] = D2
+        ov6._ls_step()
+        assert ov6._ls_len == n0 + 70, "下滚重拼不得增长出重复内容"
+    assert (ov6._ls_stitched[H6:] == snap).all(), "来回滚动不得改变已拼内容"
+
     ov6._exit_longshot()
     assert ov6._ls_stitched is None and ov6._ls_ref_gray is None, \
         "退出应同时释放参考帧"
