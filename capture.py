@@ -1385,7 +1385,7 @@ class CaptureOverlay(QWidget):
         ring += QRegion(self.toolbar.geometry())
         self.setMask(ring)
         if getattr(self, "_ls_timer", None) is None:
-            self._ls_timer = QTimer(self, interval=150)   # 快滚时单拍位移更小、易落栅格
+            self._ls_timer = QTimer(self, interval=100)   # 更快发现页面停住
             self._ls_timer.timeout.connect(self._ls_step)
         self._ls_timer.start()
         # setMask 是异步窗口系统操作：立即抓首帧会抓到覆盖层自己的暗化画面，
@@ -1623,7 +1623,7 @@ class CaptureOverlay(QWidget):
         # 平滑滚动/流式渲染，拼进长图就是用户反复看到的横向拖影。宁丢勿糊。
         d_prev = np.abs(cur_gray[::2, ::2] - prev_gray[::2, ::2])
         d_ref = np.abs(cur_gray[::2, ::2] - ref_gray[::2, ::2])
-        settled = float((d_prev > 0).mean()) < 0.0005
+        settled = float((d_prev > 0).mean()) < 0.002
         moved = float((d_ref > 2).mean()) >= 0.002
         if settled and moved:
             self._ls_align(cur, cur_gray)
@@ -1639,7 +1639,7 @@ class CaptureOverlay(QWidget):
         只在沉降帧调用：锚定条带必须逐像素精确命中（tol=0），重叠区再做
         常规验证（±2 容忍悬浮件遮挡）。"""
         ref_gray = self._ls_ref_gray
-        gate, ltol = 0.9, 0
+        gate, ltol = 0.9, 1         # 沉降帧允许 1px 抗锯齿差异，避免一直对不上
         d_s, d_r = self._down_align(ref_gray, cur_gray, min_ratio=gate, locate_tol=ltol)
         u_s, u_r = self._up_align(cur_gray, ref_gray, min_ratio=gate, locate_tol=ltol)
         if d_s >= 1 and (u_s < 1 or d_r >= u_r):   # 平手归向下：不无端改向
@@ -1810,8 +1810,8 @@ class CaptureOverlay(QWidget):
             return
         now = time.monotonic()
         if not force and self._ls_preview_h and \
-                self._ls_len - self._ls_preview_h < 32 and \
-                now - self._ls_preview_t < 0.4:
+                self._ls_len - self._ls_preview_h < 8 and \
+                now - self._ls_preview_t < 0.12:
             return
         self._ls_preview_h = self._ls_len
         self._ls_preview_t = now
