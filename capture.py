@@ -1,6 +1,7 @@
 """截图覆盖层 — 暗化遮罩 + 窗口吸附 + 选区 + PixPin 风格工具栏 + 标注。"""
 import ctypes
 import math
+import os
 
 import numpy as np
 from ctypes import wintypes
@@ -146,6 +147,11 @@ class LongshotPreview(QWidget):
         self.lab.setStyleSheet(
             "background:#1E2126;color:#C9CDD4;font-size:11px;padding:2px;")
         col.addWidget(self.lab)
+        self.status = QLabel("")
+        self.status.setAlignment(Qt.AlignHCenter)
+        self.status.setStyleSheet("color:#C9CDD4;font-size:10px;background:transparent;")
+        self.status.hide()
+        col.addWidget(self.status)
         btns = QHBoxLayout()
         btns.setSpacing(6)
         btn_ok = QPushButton("完成 (Enter)")
@@ -169,7 +175,7 @@ class LongshotPreview(QWidget):
 
     def _apply_height(self, content_h: int):
         """按预览内容高度调整窗口高度，并夹在当前屏幕内。"""
-        total = content_h + 36                     # 边距2*2 + 间距4 + 按钮行24 + 余量
+        total = content_h + 50                     # 边距2*2 + 间距4*2 + 状态14 + 按钮行24 + 余量
         scr = self.screen() or QApplication.primaryScreen()
         max_h = scr.availableGeometry().height() - 24 if scr else total
         self.setFixedHeight(max(96, min(total, max_h)))
@@ -181,13 +187,16 @@ class LongshotPreview(QWidget):
     def set_pix(self, pix: QPixmap):
         """内容越长预览越高，达到上限后整体等比缩小（不再一味变小变窄）。
 
-        预览用 FastTransformation：每 350ms 对不断增长的大图做平滑缩放太卡，
+        预览用 FastTransformation：每 300ms 对不断增长的大图做平滑缩放太卡，
         最终导出仍用原始数据，不受影响。
         """
         if pix.isNull():
             self.lab.setText("在选区内滚动页面，\n开始拼接长图…")
+            self.status.hide()
             self._apply_height(60)
             return
+        self.status.setText(f"{pix.width()} × {pix.height()} px")
+        self.status.show()
         max_h = min(self.MAX_CONTENT_H, 60000)
         scaled = pix.scaled(184, max_h, Qt.KeepAspectRatio, Qt.FastTransformation)
         self.lab.setPixmap(scaled)
@@ -243,6 +252,11 @@ class CaptureOverlay(QWidget):
         self._longshot = False
         self._ls_prev = None
         self._ls_stitched = None
+        self._ls_buf = None
+        self._ls_len = 0
+        self._ls_cap = 0
+        self._ls_ref_gray = None
+        self._ls_preview_h = 0
         self._ls_scheduled = False
         self._preview = None
 
@@ -806,9 +820,18 @@ class CaptureOverlay(QWidget):
         hole = QRegion(self._sel)
         self.setMask(QRegion(self.rect()) - hole)
         self._ls_prev, self._ls_prev_gray = self._grab_region()
-        self._ls_stitched = self._ls_prev.copy()
+        # 预分配拼接缓冲：逐帧 vstack 全量拷贝是长图越拼越卡的元凶，改为倍增扩容
+        w3 = max(1, self._ls_prev.shape[1] * 3)
+        self._ls_cap = max(1000, min(40000, 150 * 1024 * 1024 // w3))  # 彩色按字节量封顶
+        H0, W0 = self._ls_prev.shape[:2]
+        self._ls_buf = np.empty((min(self._ls_cap, max(H0 * 2, 256)), W0, 3), np.uint8)
+        self._ls_buf[:H0] = self._ls_prev
+        self._ls_len = H0
+        self._ls_stitched = self._ls_buf[:H0]
+        self._ls_ref_gray = self._ls_prev_gray   # 拼接参考帧：只在拼接成功时前进
+        self._ls_preview_h = 0
         self._make_preview()
-        self._ls_timer = QTimer(self, interval=350)
+        self._ls_timer = QTimer(self, interval=300)
         self._ls_timer.timeout.connect(self._ls_step)
         self._ls_timer.start()
         self.activateWindow()
@@ -816,7 +839,9 @@ class CaptureOverlay(QWidget):
 
     def _grab_region(self):
         """只抓选区洞（开销随选区而非全屏）。返回 (彩色RGB, 灰度)：
-        拼接/导出用彩色；滚动位移比对用灰度（绿通道近似亮度）。"""
+        拼接/导出用彩色；滚动位移比对用灰度（绿通道近似亮度）。
+        np.array 强制拷贝：stride 恰好无 padding 时 ascontiguousarray 会原样
+        返回视图，QImage 底层内存随局部 img 销毁，事后读到的是已释放内存。"""
         g = self._sel.translated(self._origin)
         img = self._screen.grabWindow(
             0, g.x(), g.y(), g.width(), g.height()
@@ -824,57 +849,121 @@ class CaptureOverlay(QWidget):
         h, w = img.height(), img.width()
         arr = np.frombuffer(img.constBits(), dtype=np.uint8).reshape(h, img.bytesPerLine())
         arr = arr[:, :w * 3].reshape(h, w, 3)
-        color = np.ascontiguousarray(arr)
+        color = np.array(arr)                            # 必须真拷贝（见上）
         return color, np.ascontiguousarray(arr[:, :, 1].astype(np.int16))
 
     @staticmethod
-    def _find_dy(prev, cur, max_shift=420):
-        H = cur.shape[0]
-        if prev.shape[0] != H or H < 80:
+    def _find_dy(ref, cur, fixed=None, max_shift=900):
+        """沉降帧精确对齐（参考 ShareX ScrollingCaptureManager.CombineImages 的
+        「重叠区实心一致行」思路）：行均值投影只负责粗排候选，真正判定靠
+        「从重叠区底边向上数连续逐像素一致行」（±2 容差，悬浮固定件行通配），
+        实心一致行不足的候选一律拒绝。
+
+        平滑滚动的动画中间帧（分数像素位置渲染）凑不出实心一致行，天然被拒；
+        参考帧只在拼接成功时前进，动画沉降后按真实位移一帧补齐——文字重影
+        与模糊由此消除。返回滚动位移 dy（0 = 本帧不拼接）。"""
+        H, W = cur.shape
+        if ref.shape[0] != H or H < 80:
             return 0
+        if float(ref.std()) < 2.0:
+            return 0                       # 近匀质画面投影无处对齐，防随机错配
         maxs = min(max_shift, H - 60)
-        best_s, best_d = 0, 1e18
-        for s in range(0, maxs, 2):
-            d = float(np.mean(np.abs(cur[:H - s] - prev[s:H])))
-            if d < best_d:
-                best_d, best_s = d, s
-        for s in range(max(0, best_s - 2), min(maxs, best_s + 3)):
-            d = float(np.mean(np.abs(cur[:H - s] - prev[s:H])))
-            if d < best_d:
-                best_d, best_s = d, s
-        if best_s < 2 or best_d > 18:
+        pp = ref.mean(axis=1, dtype=np.float32)
+        cp = cur.mean(axis=1, dtype=np.float32)
+        diffs = np.empty(maxs, dtype=np.float32)
+        for s in range(maxs):
+            diffs[s] = np.abs(cp[:H - s] - pp[s:H]).mean()
+        order = np.argsort(diffs)
+        cand = []
+        for s in order:
+            if all(abs(int(s) - c0) > 3 for c0 in cand):
+                cand.append(int(s))
+            if len(cand) >= 8:
+                break
+        cand.sort()                        # 同分时小位移优先（少拼内容更安全）
+        # 采样列带：避开左右边缘（滚动条/窗框），中段均匀取 4 带
+        margin = max(8, min(W // 5, 60))
+        span = max(1, W - 2 * margin)
+        band = max(12, span // 8)
+        starts = margin + span * np.arange(4) // 4
+        cols = np.unique(np.concatenate(
+            [np.arange(st, min(st + band, W - margin)) for st in starts]))
+        best_s, best_run = 0, 0
+        for s in cand:
+            run = CaptureOverlay._match_run(cur, ref, s, cols, fixed)
+            if run > best_run:
+                best_run, best_s = run, s
+                if run >= (H - s) * 3 // 4:    # 已证重叠区 3/4 实心一致，无需更优
+                    break
+        if best_s < 1 or best_run < max(12, H // 8):
             return 0
         return best_s
+
+    @staticmethod
+    def _match_run(cur, ref, dy, cols, fixed=None):
+        """重叠区底边向上数连续一致行：cur[r] 与 ref[r+dy] 在采样列带内全部
+        逐像素一致（±2）才算一致行；fixed 行（悬浮固定件）按通配跳过。
+        返回从底边起的实心一致行数。"""
+        H = cur.shape[0]
+        ov = H - dy                              # 重叠行数
+        if ov <= 0:
+            return 0
+        eq = (np.abs(cur[:ov, cols] - ref[dy:H, cols]) <= 2).all(axis=1)
+        if fixed is not None and fixed.shape[0] == H:
+            eq = eq | fixed[:ov]
+        mrev = eq[::-1]
+        bad = np.flatnonzero(~mrev)
+        return int(bad[0]) if bad.size else int(mrev.size)
 
     def _ls_step(self):
         if not self._longshot:
             return
         cur, cur_gray = self._grab_region()   # 选区是透明洞，抓到实时画面
-        dy = self._find_dy(self._ls_prev_gray, cur_gray)
-        import os
+        prev_gray = self._ls_prev_gray
+        ref_gray = self._ls_ref_gray
+        fixed = None
+        dy = 0
+        if cur_gray.shape == ref_gray.shape and \
+                float(np.abs(cur_gray[::4, ::4] - ref_gray[::4, ::4]).mean()) >= 0.3:
+            # 相对参考帧有位移才进匹配；动画中间帧凑不出实心一致行会被拒，
+            # 参考帧不前进，沉降后的帧按真实位移一次补齐（重影根因消除）
+            fixed = self._static_fixed(cur_gray, prev_gray)
+            dy = self._find_dy(ref_gray, cur_gray, fixed=fixed)
         if os.environ.get('SNAPPIN_DEBUG'):
-            diff = float((abs(cur_gray - self._ls_prev_gray)).mean()) \
-                if cur_gray.shape == self._ls_prev_gray.shape else -1
+            diff = float((abs(cur_gray - ref_gray)).mean()) \
+                if cur_gray.shape == ref_gray.shape else -1
             print('LS_STEP dy=', dy, 'diff=', round(diff, 2), flush=True)
-        if dy >= 2:
+        if dy >= 1:
             H = cur.shape[0]
-            fixed = self._static_fixed(cur_gray, self._ls_prev_gray)
             cur_out = cur
-            if fixed.any():
+            if fixed is not None and fixed.any():
                 # 悬浮固定件（回到底部↓/吸顶栏等）钉在视口不动，直接拼会沿长图
                 # 重复盖章：填充消除后拼接，并同步擦掉首帧落在拼接图头部的盖章
                 cur_out = self._fill_static(cur.copy(), fixed)
-                if self._ls_stitched.shape[0] >= H \
-                        and self._ls_stitched.shape[1] == cur.shape[1]:
-                    self._ls_stitched[:H] = self._fill_static(
-                        self._ls_stitched[:H].copy(), fixed)
-            w3 = max(1, cur.shape[1] * 3)
-            cap = max(1000, min(40000, 150 * 1024 * 1024 // w3))  # 彩色按字节量封顶
-            self._ls_stitched = np.vstack([self._ls_stitched, cur_out[H - dy:]])
-            if self._ls_stitched.shape[0] > cap:
-                self._ls_stitched = self._ls_stitched[:cap]
+                if self._ls_len >= H and self._ls_buf is not None \
+                        and self._ls_buf.shape[1] == cur.shape[1]:
+                    self._fill_static(self._ls_buf[:H], fixed)
+            self._ls_append(cur_out[H - dy:])
             self._update_preview()
+            self._ls_ref_gray = cur_gray      # 只有拼接成功才前进参考帧
         self._ls_prev, self._ls_prev_gray = cur, cur_gray
+
+    def _ls_append(self, band):
+        """新增行写入预分配缓冲（倍增扩容）；超出按 150MB 折算行数截断，
+        保头部丢弃溢出——与旧 vstack 切断语义一致，但不再每帧全量拷贝。"""
+        if self._ls_len >= self._ls_cap:
+            return
+        rows = self._ls_buf.shape[0]
+        need = self._ls_len + band.shape[0]
+        if need > rows:
+            new_rows = min(self._ls_cap, max(rows * 2, need))
+            buf = np.empty((new_rows, self._ls_buf.shape[1], 3), np.uint8)
+            buf[:self._ls_len] = self._ls_buf[:self._ls_len]
+            self._ls_buf = buf
+        stop = min(need, self._ls_cap)
+        self._ls_buf[self._ls_len:stop] = band[:stop - self._ls_len]
+        self._ls_len = stop
+        self._ls_stitched = self._ls_buf[:self._ls_len]
 
     @staticmethod
     def _static_fixed(cur_gray, prev_gray):
@@ -882,7 +971,7 @@ class CaptureOverlay(QWidget):
         （按钮/吸顶栏像素纹丝不动；滚动中的正文行不可能逐像素相同）"""
         if cur_gray.shape != prev_gray.shape:
             return np.zeros(cur_gray.shape[0], dtype=bool)
-        same = (np.abs(cur_gray - prev_gray) <= 2).mean(axis=1)
+        same = (np.abs(cur_gray[:, ::2] - prev_gray[:, ::2]) <= 2).mean(axis=1)
         return same > 0.92
 
     @staticmethod
@@ -921,7 +1010,14 @@ class CaptureOverlay(QWidget):
                 min(self._sel.bottom() + 8, self.height() - tb.height() - 4))
         tb.show()
 
-    def _update_preview(self):
+    def _update_preview(self, force=False):
+        """节流：内容每长 ≥24 行才重渲染一次预览（全图缩放随长图越来越贵）。"""
+        if self._preview is None or self._ls_stitched is None:
+            return
+        if not force and self._ls_preview_h and \
+                self._ls_len - self._ls_preview_h < 24:
+            return
+        self._ls_preview_h = self._ls_len
         c = self._ls_stitched
         h, w = c.shape[:2]
         img = QImage(c.tobytes(), w, h, w * 3, QImage.Format_RGB888)
@@ -952,6 +1048,11 @@ class CaptureOverlay(QWidget):
                 self._preview.on_cancel = None
                 self._preview.close()
                 self._preview = None
+            # 释放拼接缓冲：长图可达百 MB 级，别等覆盖层销毁才回收
+            self._ls_buf = None
+            self._ls_stitched = None
+            self._ls_len = 0
+            self._ls_ref_gray = None
 
     # ------------------------------------------------ 完成/导出
     def _compose(self) -> QPixmap:
@@ -1190,4 +1291,105 @@ if __name__ == "__main__":
     out = CaptureOverlay._fill_static(col.copy(), fixed)
     assert not (out[28:38] == 77).any(), "悬浮按钮应被填充消除"
     assert (out[5] == col[5]).all(), "正常内容行必须保持原样"
-    print("capture 自测通过: 惰性马赛克/工具栏/预暗化绘制/长截图守卫收尾/彩色拼接/固定件消除 全部 OK")
+
+    # ---- 沉降帧精确对齐：动画中间帧拒绝/沉降帧实心拼接/固定件通配/匀质防错配
+    prof = np.tile(np.arange(400, dtype=np.int16)[:, None], (1, 90))
+    assert CaptureOverlay._find_dy(prof, np.roll(prof, -1, axis=0)) == 1, \
+        "慢速滚动 1px 也应被捕获"
+    assert CaptureOverlay._find_dy(prof, np.roll(prof, -300, axis=0)) == 300, \
+        "大步长滚动应在新量程内命中"
+    blank = np.full((400, 90), 240, np.int16)
+    assert CaptureOverlay._find_dy(blank, np.roll(blank, -50, axis=0)) == 0, \
+        "匀质空白区投影无处对齐,不应随机错配污染长图"
+    rng = np.random.default_rng(7)
+    tex = rng.integers(0, 255, (400, 90), dtype=np.int16)
+    mid = (np.roll(tex, -7, axis=0) + np.roll(tex, -8, axis=0)) // 2   # 7.5px 中间态
+    assert CaptureOverlay._find_dy(tex, mid) == 0, \
+        "平滑滚动动画中间帧(分数像素错位)必须整帧拒绝——文字重影的根源"
+    assert CaptureOverlay._find_dy(tex, np.roll(tex, -15, axis=0)) == 15, \
+        "沉降帧应按真实位移实心拼接"
+    cur_fx = np.roll(tex, -20, axis=0).copy()
+    cur_fx[375] = 123                                   # 悬浮按钮钉在视口原位
+    assert CaptureOverlay._find_dy(tex, cur_fx) == 0, \
+        "固定件行阻断实心一致时应拒绝整帧(保守不拼)"
+    fx = np.zeros(400, bool); fx[375] = True
+    assert CaptureOverlay._find_dy(tex, cur_fx, fixed=fx) == 20, \
+        "固定件行作通配后应按真实位移拼接"
+
+    # ---- 预分配拼接缓冲：倍增扩容/首帧保留/追加落位
+    ov4 = CaptureOverlay(app.primaryScreen(), config.load())
+    ov4._sel = QRect(40, 40, 300, 200)
+    ov4._enter_longshot()
+    H0 = ov4._ls_prev.shape[0]
+    band = np.full((50, ov4._ls_prev.shape[1], 3), 200, np.uint8)
+    for _ in range(6):
+        ov4._ls_append(band)
+    assert ov4._ls_len == H0 + 300 and ov4._ls_buf.shape[0] >= H0 + 300, \
+        "缓冲应按需倍增扩容"
+    assert (ov4._ls_stitched[:H0] == ov4._ls_prev).all(), "拼接图首帧必须保留"
+    assert (ov4._ls_stitched[-50:] == 200).all(), "追加行必须正确落位"
+
+    # ---- 预览节流：无新增行不重渲染，新增 ≥24 行才刷新
+    ov4._update_preview(force=True)                   # 同步预览水位到当前长度
+    called = []
+    ov4._preview.set_pix = lambda p: called.append(1)
+    ov4._update_preview()
+    assert len(called) == 0, "无新增行不应重渲染预览"
+    ov4._ls_append(band[:30])
+    ov4._update_preview()
+    assert len(called) == 1, "新增行达到阈值应刷新预览"
+    ov4._exit_longshot()
+
+    # ---- 上限截断：保头部、丢溢出（与旧 vstack 语义一致），满后再拼整体丢弃
+    ov5 = CaptureOverlay(app.primaryScreen(), config.load())
+    ov5._sel = QRect(40, 40, 300, 200)
+    ov5._enter_longshot()
+    H0 = ov5._ls_prev.shape[0]
+    ov5._ls_cap = H0 + 120
+    for _ in range(4):
+        ov5._ls_append(band)                          # H0→+50→+100→+120 截断
+    assert ov5._ls_len == H0 + 120, "超出 150MB 折算行数应截断"
+    assert (ov5._ls_stitched[:H0] == ov5._ls_prev).all(), "截断必须保留头部首帧"
+    assert (ov5._ls_stitched[-1] == 200).all()
+    ov5._ls_append(band)                              # 已满：继续追加应被丢弃
+    assert ov5._ls_len == H0 + 120, "满缓冲继续拼接应被丢弃"
+    ov5._exit_longshot()
+    assert ov5._ls_stitched is None and not ov5._ls_timer.isActive(), \
+        "退出应释放拼接缓冲并停止定时器"
+
+    # ---- 多拍流程：参考帧持久化——动画帧拒绝不丢内容，沉降后按真实位移补齐
+    ov6 = CaptureOverlay(app.primaryScreen(), config.load())
+    ov6._sel = QRect(40, 40, 300, 200)
+    ov6._enter_longshot()
+    H6, W6 = ov6._ls_prev.shape[:2]
+    base = rng.integers(0, 255, (H6, W6), dtype=np.int16)
+    ov6._ls_ref_gray = base.copy()        # 换假参考帧（缓冲内容与本逻辑无关）
+    seq = {"mid": (base + np.roll(base, -10, axis=0)) // 2,   # 动画中间帧
+           "B": np.roll(base, -40, axis=0),                    # 沉降：滚 40
+           "C": np.roll(base, -25, axis=0),                    # 回滚 15（应忽略）
+           "D": np.roll(base, -70, axis=0)}                    # 再滚 30（B→D）
+    holder = {"frame": seq["mid"]}
+    ov6._grab_region = lambda: (np.stack([holder["frame"].astype(np.uint8)] * 3, axis=2),
+                                holder["frame"].copy())
+    n0 = ov6._ls_len
+    ov6._ls_step()                        # 动画帧：拒绝
+    assert ov6._ls_len == n0 and (ov6._ls_ref_gray == base).all(), \
+        "动画中间帧应被拒绝且参考帧不前进"
+    holder["frame"] = seq["B"]
+    ov6._ls_step()                        # 沉降帧：一次补齐 40 行
+    assert ov6._ls_len == n0 + 40, f"沉降帧应一次补齐 40 行, 实际 +{ov6._ls_len - n0}"
+    assert (ov6._ls_ref_gray == seq["B"]).all(), "拼接成功后参考帧应前进到 B"
+    holder["frame"] = seq["C"]
+    ov6._ls_step()                        # 回滚：忽略
+    assert ov6._ls_len == n0 + 40, "向上回滚应被忽略"
+    holder["frame"] = seq["B"]
+    ov6._ls_step()                        # 与参考帧相同：静止快筛跳过
+    assert ov6._ls_len == n0 + 40, "与参考帧相同不应重复拼接"
+    holder["frame"] = seq["D"]
+    ov6._ls_step()                        # 再滚 30 行
+    assert ov6._ls_len == n0 + 70, f"再次滚动应续拼 30 行, 实际 +{ov6._ls_len - n0 - 40}"
+    ov6._exit_longshot()
+    assert ov6._ls_stitched is None and ov6._ls_ref_gray is None, \
+        "退出应同时释放参考帧"
+    print("capture 自测通过: 惰性马赛克/工具栏/预暗化绘制/长截图守卫收尾/彩色拼接/"
+          "固定件消除/沉降帧对齐/参考帧持久化/缓冲扩容截断/预览节流 全部 OK")
