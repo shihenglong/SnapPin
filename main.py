@@ -297,6 +297,7 @@ class App:
         self.clip_store = None
         self.clip_monitor = None
         self.clip_win = None
+        self.clip_sync = None
         self._clip_db = None
         cc = self.cfg["clip"]
         if not cc.get("enabled", True):
@@ -313,18 +314,32 @@ class App:
                                    on_settings=self.open_settings,
                                    pw_provider=lambda: self._ensure_pw_store(quiet=True),
                                    on_pwman=self.open_pwman)
+        # 局域网同步（Ditto「朋友」式）：本机新条目发给好友，收到的回放剪贴板
+        from clipsync import ClipSync
+        self.clip_sync = ClipSync(self.clip_store, self.cfg,
+                                  suppress=self.clip_monitor.suppress_next)
+        self.clip_monitor.changed.connect(self.clip_sync.send_clip)
+        self.clip_sync.received.connect(self._on_clip_received)
+
+    def _on_clip_received(self, _cid):
+        """收到局域网条目：历史窗口开着就刷新，让远端条目立刻可见。"""
+        if self.clip_win is not None and self.clip_win.isVisible():
+            self.clip_win.refresh()
 
     def _teardown_clip(self):
-        for attr in ("clip_monitor", "clip_win"):
+        for attr in ("clip_monitor", "clip_win", "clip_sync"):
             obj = getattr(self, attr, None)
             if obj:
                 try:
+                    if hasattr(obj, "stop"):
+                        obj.stop()
                     obj.hide()
                 except Exception:
                     pass
                 obj.deleteLater()
         self.clip_monitor = None
         self.clip_win = None
+        self.clip_sync = None
         self.clip_store = None
         self._clip_db = None
 
@@ -340,6 +355,12 @@ class App:
         elif self.clip_store:
             self.clip_store.retention_days = int(cc.get("retention_days", 7) or 0)
             self.clip_store.max_entries = int(cc.get("max_entries", 500) or 0)
+            if self.clip_sync is not None:
+                self.clip_sync.reload()       # 局域网同步开关/端口/好友即时生效
+        err = getattr(self.clip_sync, "last_error", "") if self.clip_sync else ""
+        if err:
+            self.tray.showMessage("SnapPin 局域网同步", err,
+                                  QSystemTrayIcon.Warning, 6000)
 
     # ------------------------------------------------ 截图
     def start_capture(self):

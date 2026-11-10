@@ -340,6 +340,7 @@ class ClipWindow(QWidget):
         self._drag_off: QPoint | None = None
         self._last_paste = 0.0
         self._target_hwnd = 0          # popup 前的前台窗口：锁定态粘贴目标
+        self._tip_item = None          # 悬停预览当前展示的行（防重复弹出闪烁）
 
         cc = cfg.setdefault("clip", {})  # config.py 默认没有 clip 段，就地补齐
         cc.setdefault("popup_pos", "cursor")
@@ -390,8 +391,8 @@ class ClipWindow(QWidget):
         self.list = _HintList()
         self.list.setObjectName("ClipList")
         self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.list.setIconSize(QSize(30, 30))
-        self.list.setMouseTracking(True)  # 悬停预览需要 itemEntered
+        self.list.setIconSize(QSize(36, 36))
+        self.list.setMouseTracking(True)  # 悬停预览需要 itemEntered/MouseMove
         self.list.itemClicked.connect(lambda it: self._paste(it.data(Qt.UserRole)))
         self.list.itemDoubleClicked.connect(lambda it: self._paste(it.data(Qt.UserRole)))
         self.list.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -469,6 +470,7 @@ class ClipWindow(QWidget):
     # ------------------------------------------------ 列表
     def refresh(self):
         self._tip.hide()
+        self._tip_item = None
         self.list.clear()
         self._pw_items = []
         self._items = []
@@ -509,6 +511,7 @@ class ClipWindow(QWidget):
                 self.list.hint = "还没有常用项（右键条目 → 设为常用）"
             else:
                 self.list.hint = "暂无剪贴板记录"
+        self.list.scrollToTop()           # 每次刷新（含打开时）定位到最上面
 
     def _query_pw(self, search: str, allow_all: bool = False) -> list[dict]:
         """搜索词非空时查密码库（quick_search 仅解密命中行）；密码模式空搜索列出全部。"""
@@ -539,17 +542,17 @@ class ClipWindow(QWidget):
         fm = self.list.fontMetrics()
         if ci.files:  # 文件
             line1 = _trunc(", ".join(os.path.basename(f) for f in ci.files), 60)
-            icon = _svg_icon(_SVG_FILE, "#6AA1F8", 30, 1.4)
+            icon = _svg_icon(_SVG_FILE, "#6AA1F8", 36, 1.4)
         elif ci.has_image:  # 图片
             dims = self._image_dims(ci)
             line1 = f"图片 {dims[0]}x{dims[1]}" if dims else "图片"
             icon = None  # 用缩略图
         elif _sanitize(ci.text):  # 文本
             line1 = _trunc(ci.text.strip().splitlines()[0] if ci.text.strip() else "", 60)
-            icon = _svg_icon(_SVG_TEXT, "#7BB89A", 30, 1.4)
+            icon = _svg_icon(_SVG_TEXT, "#7BB89A", 36, 1.4)
         else:  # 其他格式
             line1 = _trunc("、".join(ci.fmt_names[:3]), 60)
-            icon = _svg_icon(_SVG_BOX, "#B3BAC8", 30, 1.4)
+            icon = _svg_icon(_SVG_BOX, "#B3BAC8", 36, 1.4)
         line2 = time.strftime("%m-%d %H:%M", time.localtime(ci.ts))
         if ci.source_app:
             line2 += f" · {ci.source_app}"
@@ -559,7 +562,7 @@ class ClipWindow(QWidget):
         if ci.has_image and ci.thumb_png:          # 图片项用缩略图做图标（行内小图）
             img = QImage.fromData(QByteArray(ci.thumb_png))
             if not img.isNull():
-                pm = QPixmap.fromImage(img).scaled(30, 30, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                pm = QPixmap.fromImage(img).scaled(36, 36, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 icon = QIcon(pm)
                 it.setData(Qt.UserRole + 1, bytes(ci.thumb_png))  # 悬停弹出稍大预览
 
@@ -579,8 +582,8 @@ class ClipWindow(QWidget):
         h.addWidget(num_lab)
         if icon is not None:
             ic = QLabel()
-            ic.setPixmap(icon.pixmap(30, 30))
-            ic.setFixedSize(30, 30)
+            ic.setPixmap(icon.pixmap(36, 36))
+            ic.setFixedSize(36, 36)
             ic.setAlignment(Qt.AlignCenter)
             h.addWidget(ic)
         v = QVBoxLayout()
@@ -699,16 +702,21 @@ class ClipWindow(QWidget):
         self._delete(data)
 
     def _on_item_entered(self, item):
-        """悬停图片条目 → 光标附近弹出稍大的缩略图（≤120px，无大图窗）。"""
+        """悬停图片条目 → 光标附近弹出稍大的缩略图（≤160px，无大图窗）。"""
+        self._show_tip(item)
+
+    def _show_tip(self, item):
         png = item.data(Qt.UserRole + 1)
         if not png:
             self._tip.hide()
+            self._tip_item = None
             return
         img = QImage.fromData(QByteArray(png))
         if img.isNull():
             self._tip.hide()
+            self._tip_item = None
             return
-        pm = QPixmap.fromImage(img).scaled(120, 120, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        pm = QPixmap.fromImage(img).scaled(160, 160, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self._tip.setPixmap(pm)
         self._tip.adjustSize()
         g = (QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()).availableGeometry()
@@ -720,16 +728,46 @@ class ClipWindow(QWidget):
             y = p.y() - self._tip.height() - 12
         self._tip.move(max(g.left() + 4, x), max(g.top() + 4, y))
         self._tip.show()
+        self._tip_item = item
+
+    def _hover_update(self, pos):
+        """按视口坐标实时解析悬停行——itemEntered 只在鼠标划入新行时触发，
+        滚轮让行在光标下移动、refresh 重建行后光标不动都触发不了，悬停预览
+        「偶发弹不出来」的根因；MouseMove/Wheel 路径统一走这里。"""
+        it = self.list.itemAt(pos)
+        if it is None or it.data(Qt.UserRole + 1) is None:
+            self._tip.hide()
+            self._tip_item = None
+            return
+        if self._tip.isVisible():
+            if it is self._tip_item:
+                return                     # 同一行已展示，不动防闪烁
+            if self._tip.geometry().contains(QCursor.pos()):
+                self._tip.hide()           # 光标挪进了浮窗：先收起，移出再弹
+                self._tip_item = None
+                return
+        self._show_tip(it)
 
     def hide(self):
         """隐藏窗口并收起悬停预览。"""
         self._tip.hide()
+        self._tip_item = None
         super().hide()
 
     def eventFilter(self, obj, e):
-        """搜索框：↓ 进列表 / 回车粘贴；列表视口：鼠标离开收起悬停预览。"""
-        if obj is self.list.viewport() and e.type() == QEvent.Leave:
-            self._tip.hide()
+        """搜索框：↓ 进列表 / 回车粘贴；列表视口：鼠标离开收起悬停预览，
+        移动/滚轮按坐标实时刷新悬停预览（见 _hover_update）。"""
+        if obj is self.list.viewport():
+            t = e.type()
+            if t == QEvent.Leave:
+                self._tip.hide()
+                self._tip_item = None
+            elif t == QEvent.MouseMove:
+                self._hover_update(e.position().toPoint())
+            elif t == QEvent.Wheel:
+                # 滚轮后行才挪位：等滚动生效再按光标当前位置解析
+                QTimer.singleShot(0, lambda: self._hover_update(
+                    self.list.viewport().mapFromGlobal(QCursor.pos())))
             return False
         if obj is self.search and e.type() == QEvent.KeyPress:
             k = e.key()
@@ -1188,9 +1226,53 @@ if __name__ == "__main__":
                   if win.list.item(i).data(Qt.UserRole + 1) is None)
     win._on_item_entered(txt_it)
     assert not win._tip.isVisible(), "非图片行不应弹预览"
+
+    # ---- 悬停预览增强：坐标驱动(_hover_update)+160px 大预览+滚轮路径
+    big = QImage(400, 300, QImage.Format_RGB32)
+    big.fill(0xFF6AA1F8)
+    _buf2 = QBuffer()
+    _buf2.open(QBuffer.WriteOnly)
+    assert big.save(_buf2, "PNG")
+    store.add({"formats": {"image/png": bytes(_buf2.data())}, "text": "", "hash": "himg2"})
+    win.hide()
+    win.popup()                           # popup 是 toggle：先隐藏才会走刷新分支
+    # 缩略图入库已按 192px 框缩放：400x300 → 192x144，用它识别"大图"条目
+    big_it = next(win.list.item(i) for i in range(win.list.count())
+                  if (lambda d: QImage.fromData(QByteArray(d)).size() == QSize(192, 144)
+                      if d else False)(win.list.item(i).data(Qt.UserRole + 1)))
+    rc = win.list.visualItemRect(big_it)
+    win._hover_update(rc.center())
+    assert win._tip.isVisible() and win._tip_item is big_it, "坐标驱动悬停应弹出预览"
+    assert win._tip.pixmap().width() == 160, "大图悬停预览应放大到 160px"
+    win._hover_update(rc.center())        # 同一行重复悬停：不闪烁不重建
+    assert win._tip_item is big_it and win._tip.isVisible()
+    txt2 = next(win.list.item(i) for i in range(win.list.count())
+                if win.list.item(i).data(Qt.UserRole + 1) is None)
+    win._hover_update(win.list.visualItemRect(txt2).center())   # 非图片行：应收起
+    assert not win._tip.isVisible() and win._tip_item is None
+    win.eventFilter(win.list.viewport(), QEvent(QEvent.Wheel))  # 滚轮路径不崩即可
+    t0 = time.time()
+    while time.time() - t0 < 0.2:
+        app.processEvents()
+        time.sleep(0.01)
+
+    # ---- 打开时滚动条置顶
+    for i in range(10):
+        store.add({"formats": {"text/plain": f"滚动置顶填充 {i}".encode()},
+                   "text": f"滚动置顶填充 {i}", "hash": f"hroll{i}"})
+    win.hide()
+    win.popup()                           # 隐藏后再 popup 才走刷新分支
+    sb = win.list.verticalScrollBar()
+    sb.setValue(sb.maximum())
+    assert sb.value() > 0, "前置：条目足够时应可滚动"
+    win.hide()
+    win.popup()
+    assert win.list.verticalScrollBar().value() == 0, "再次打开应定位到最上边"
+
     pws.close()
 
-    print("clipwin 自测通过: popup/搜索/无重影/无乱码/回放/锁定/边条/清空/键盘/悬停预览 全部 OK")
+    print("clipwin 自测通过: popup/搜索/无重影/无乱码/回放/锁定/边条/清空/键盘/"
+          "悬停预览(坐标驱动+160px)/滚动置顶 全部 OK")
     win.hide()
     QApplication.clipboard().clear()  # 规避 offscreen 平台 QClipboard 析构段错误
     del win, store  # 先销毁窗口再销毁 app，避免退出时析构顺序问题

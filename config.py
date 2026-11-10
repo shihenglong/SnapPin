@@ -57,6 +57,10 @@ DEFAULTS = {
         "pin_stay": False,         # 锁定状态：粘贴后窗口保持打开
         "retention_days": 7,       # 历史保留天数（0=永久，常用项不受影响）
         "max_entries": 500,        # 最大条数（0=不限）
+        "sync_enabled": False,     # 局域网同步（Ditto「朋友」式）
+        "sync_port": 43110,        # 监听端口（两端需一致或用 host:port 指明）
+        "sync_friends": "",        # 好友 IP/主机名，逗号分隔；空 = 只发不收不到
+        "sync_password": "",       # 网络密码（两端需一致，明文不进网络）
     },
     "pwman": {
         "db_path": "",             # 空 = %APPDATA%/SnapPin/pw.db

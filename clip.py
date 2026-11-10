@@ -51,7 +51,8 @@ def _payload_hash(text: str, files: list, formats: dict) -> str:
 
 
 def _make_thumb(formats: dict) -> bytes | None:
-    """用首个可解码的图片格式生成最长边 128px 的 PNG 缩略图字节；失败返回 None。"""
+    """用首个可解码的图片格式生成最长边 192px 的 PNG 缩略图字节；失败返回 None。
+    （192 覆盖行内 36px 图标与悬停预览 160px，放大后仍清晰）"""
     for fmt in _IMG_FMTS:
         data = formats.get(fmt)
         if not data:
@@ -59,8 +60,8 @@ def _make_thumb(formats: dict) -> bytes | None:
         img = QImage()
         if not img.loadFromData(data) or img.isNull():
             continue
-        if img.width() > 128 or img.height() > 128:
-            img = img.scaled(128, 128, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        if img.width() > 192 or img.height() > 192:
+            img = img.scaled(192, 192, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         buf = QBuffer()
         buf.open(QBuffer.WriteOnly)
         if img.save(buf, "PNG"):
@@ -361,10 +362,10 @@ if __name__ == "__main__":
     n = st.cleanup(0, 1)  # 只保留最近 1 条
     left = st.query()
     assert len(left) == 1 and left[0].id == c, f"cleanup 后应只剩 1 条, 实际 {[i.id for i in left]}"
-    # 缩略图上限 128px（悬停预览清晰度）
+    # 缩略图上限 192px（悬停预览 160px 放大后仍清晰）
     _timg = QImage()
     assert _timg.loadFromData(img_item.thumb_png)
-    assert _timg.width() <= 128 and _timg.height() <= 128, "缩略图应 ≤128px"
+    assert _timg.width() <= 192 and _timg.height() <= 192, "缩略图应 ≤192px"
 
     # 抑制泄漏回归：残留抑制 1s 后过期，不吞外部复制（截图双击复制丢历史根因）
     mon = ClipMonitor(st, enabled=True)

@@ -456,6 +456,18 @@ class SettingsDialog(QDialog):
         self.clip_max.setValue(int(cc.get("max_entries", 500)))
         self.clip_db = QLineEdit(cc.get("db_path", ""))
         self.clip_db.setPlaceholderText(f"默认：{config.clip_db_path()}")
+        # ---- 局域网同步（Ditto「朋友」式）
+        self.lan_sync = self._check("启用局域网同步", bool(cc.get("sync_enabled", False)))
+        self.lan_port = QSpinBox()
+        self.lan_port.setRange(1024, 65535)
+        self.lan_port.setValue(int(cc.get("sync_port", 43110)))
+        self.lan_port.setToolTip("默认 43110，两端一致；若提示监听失败（端口被系统保留"
+                                 "或占用）换一个即可")
+        self.lan_friends = QLineEdit(str(cc.get("sync_friends", "")))
+        self.lan_friends.setPlaceholderText("如 192.168.1.20,DESKTOP-ABC:53998（逗号分隔）")
+        self.lan_pwd = QLineEdit(str(cc.get("sync_password", "")))
+        self.lan_pwd.setEchoMode(QLineEdit.Password)
+        self.lan_pwd.setPlaceholderText("两端需一致，如 LetMeIn")
         return self._page(
             self._card("历史记录", [
                 self._row("", self.clip_enabled, "复制即自动记录：文本 / 图片 / 文件 / HTML"),
@@ -470,6 +482,17 @@ class SettingsDialog(QDialog):
                 self._row("保留天数", self.clip_days, "0 = 永久保留；常用项 📌 永不清理"),
                 self._row("最大条数", self.clip_max, "超出删最旧；0 = 不限"),
                 self._row("数据库路径", self._db_row(self.clip_db), "更改后立即生效（历史会迁到新库）"),
+            ]),
+            self._card("局域网同步", [
+                self._row("", self.lan_sync,
+                          "与局域网内其他运行 SnapPin 的电脑互相同步剪贴板条目：本机复制"
+                          "自动发给他们，他们复制的自动进本机剪贴板和历史"),
+                self._row("监听端口", self.lan_port, "两端一致；好友条目也可用 host:端口 单独指定"),
+                self._row("好友 IP / 计算机名", self.lan_friends,
+                          "逗号分隔；只接收列表内机器发来的条目，留空 = 不接收"),
+                self._row("网络密码", self.lan_pwd, "两端需一致；不一致的机器发来的条目将被丢弃"),
+                self._note("文件类条目只同步路径引用，不传文件内容；所有新复制的条目（含"
+                           "密码等敏感内容）都会自动发给好友，请仅在可信网络开启。"),
             ]))
 
     def _page_pw(self):
@@ -792,6 +815,10 @@ class SettingsDialog(QDialog):
         c["clip"]["retention_days"] = self.clip_days.value()
         c["clip"]["max_entries"] = self.clip_max.value()
         c["clip"]["db_path"] = self.clip_db.text().strip()
+        c["clip"]["sync_enabled"] = self.lan_sync.isChecked()
+        c["clip"]["sync_port"] = self.lan_port.value()
+        c["clip"]["sync_friends"] = self.lan_friends.text().strip()
+        c["clip"]["sync_password"] = self.lan_pwd.text()
         c["pwman"]["db_path"] = self.pw_db.text().strip()
         c["translate"]["engine"] = self.tr_engine.currentData()
         c["translate"]["api_base"] = self.tr_base.text().strip()
@@ -882,6 +909,10 @@ if __name__ == "__main__":
     dlg.tr_engine.setCurrentIndex(idx_glm)
 
     # 改动 + 应用（不关窗）
+    dlg.lan_sync.setChecked(True)
+    dlg.lan_port.setValue(43111)
+    dlg.lan_friends.setText("192.168.1.20,DESKTOP-A")
+    dlg.lan_pwd.setText("LetMeIn")
     dlg.hk_clip.combo = "Ctrl+Shift+V"
     dlg.autostart.setChecked(True)
     dlg.clip_days.setValue(14)
@@ -890,6 +921,9 @@ if __name__ == "__main__":
     assert cfg["clip"]["hotkey"] == "Ctrl+Shift+V"
     assert cfg["system"]["autostart"] is True
     assert cfg["clip"]["retention_days"] == 14
+    assert cfg["clip"]["sync_enabled"] is True and cfg["clip"]["sync_port"] == 43111
+    assert cfg["clip"]["sync_friends"] == "192.168.1.20,DESKTOP-A"
+    assert cfg["clip"]["sync_password"] == "LetMeIn"
     assert cfg["translate"]["api_key"] == "sk-test"
     assert dlg.isVisible(), "应用后窗口应保持打开"
 
