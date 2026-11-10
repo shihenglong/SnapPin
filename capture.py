@@ -64,15 +64,12 @@ class CaptureToolbar(QWidget):
                     "pen": "画笔", "marker": "马克笔", "mosaic": "马赛克", "text": "文字",
                     "serial": "标记序号（单击放置，序号自动递增）",
                     "eraser": "橡皮擦", "save": "保存", "close": "关闭 (Esc)",
-                    "longshot": "长截图（滚动拼接）", "gif": "GIF 录制（后续版本）",
+                    "longshot": "长截图（滚动拼接）", "gif": "GIF 录制（选区固定，10fps）",
                     "pin": "贴图 (Ctrl+D)", "copy": "截图并复制 (Enter)"}
             b.setToolTip(tips.get(name, name))
             b.setIcon(icon(name, "#4E5969", 20, 1.6))
             b.setProperty("tool", name)
-            if name == "gif":
-                b.setEnabled(False)
-            else:
-                b.clicked.connect(lambda _=False, n=name: self.action.emit(n))
+            b.clicked.connect(lambda _=False, n=name: self.action.emit(n))
             row.addWidget(b)
             self._tool_buttons[name] = b
         col.addLayout(row)
@@ -215,6 +212,53 @@ class LongshotPreview(QWidget):
         self._apply_height(scaled.height() + 4)
 
 
+# ---------------------------------------------------------------- GIF 录制状态条
+class GifBar(QWidget):
+    """GIF 录制状态条：深色卡片 + 红色主按钮，独立顶层窗口。"""
+
+    def __init__(self):
+        super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setWindowTitle("SnapPin GIF 录制")
+        self.on_stop = None
+        self.on_cancel = None
+        col = QVBoxLayout(self)
+        col.setContentsMargins(8, 8, 8, 8)
+        col.setSpacing(6)
+        self.status = QLabel("● 准备录制…")
+        self.status.setStyleSheet(
+            "color:#F53F3F;font:12px 'Microsoft YaHei';background:transparent;")
+        col.addWidget(self.status)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        btn_stop = QPushButton("停止并保存")
+        btn_cancel = QPushButton("取消")
+        for b in (btn_stop, btn_cancel):
+            b.setFixedHeight(28)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setFocusPolicy(Qt.NoFocus)
+        btn_stop.setStyleSheet(
+            "QPushButton{background:#F53F3F;color:#FFFFFF;border:none;"
+            "border-radius:7px;font-size:12px;font-weight:600;}"
+            "QPushButton:hover{background:#D93030;}"
+            "QPushButton:pressed{background:#B92525;}")
+        btn_cancel.setStyleSheet(
+            "QPushButton{background:#2B3038;color:#C9CDD4;border:1px solid #3A4049;"
+            "border-radius:7px;font-size:12px;}"
+            "QPushButton:hover{background:#363C46;color:#FFFFFF;}"
+            "QPushButton:pressed{background:#242930;}")
+        btn_stop.clicked.connect(lambda: self.on_stop and self.on_stop())
+        btn_cancel.clicked.connect(lambda: self.on_cancel and self.on_cancel())
+        row.addWidget(btn_stop)
+        row.addWidget(btn_cancel)
+        col.addLayout(row)
+        self.setStyleSheet(
+            "GifBar{background:#1E2126;border:2px solid #F53F3F;border-radius:9px;}")
+        self.setFixedWidth(210)
+
+    def set_status(self, text: str):
+        self.status.setText(text)
+
+
 # ---------------------------------------------------------------- 覆盖层
 class CaptureOverlay(QWidget):
     sig_pin = Signal(QPixmap, QRect)
@@ -274,6 +318,15 @@ class CaptureOverlay(QWidget):
         self._ls_preview_h = 0
         self._ls_preview_t = 0.0
         self._preview = None
+        self._gif = False
+        self._gif_frames = []
+        self._gif_t0 = 0.0
+        self._gif_bar = None
+        self._gif_timer = None
+        self._gif_start_timer = None
+        self._gif_full = False
+        self._gif_max_frames = 100          # 10s @ 10fps，兼顾内存与 GIF 体积
+        self._gif_max_bytes = 120 * 1024 * 1024
 
         self._tip = QLabel(self)
         self._tip.setStyleSheet(
@@ -332,6 +385,9 @@ class CaptureOverlay(QWidget):
         self._detect_hover(QCursor.pos())
 
     def _on_esc(self):
+        if getattr(self, "_gif", False):
+            self._stop_gif(save=False)
+            return
         if getattr(self, "_longshot", False):
             self._exit_longshot()
             return
@@ -341,12 +397,16 @@ class CaptureOverlay(QWidget):
         if self._text_edit is not None:
             self._commit_text()
             return
+        if getattr(self, "_gif", False):
+            self._stop_gif(save=True)
+            return
         if getattr(self, "_longshot", False):
             self._finish_longshot()
             return
         self._finish("copy")
 
     def _cancel(self):
+        self._exit_gif()
         self._exit_longshot()
         self.sig_cancelled.emit()
         self.close()
@@ -414,7 +474,7 @@ class CaptureOverlay(QWidget):
             return
         pos = e.pos()
         self._press_pos = pos
-        if self._longshot:
+        if self._longshot or getattr(self, "_gif", False):
             return
         # 标注工具进行中
         if not self._sel.isNull() and self._sel.contains(pos):
@@ -626,6 +686,12 @@ class CaptureOverlay(QWidget):
 
     # ------------------------------------------------ 工具动作
     def _on_tool_action(self, name):
+        if getattr(self, "_gif", False):
+            if name == "gif":
+                self._stop_gif(save=True)  # 录制中再点 GIF：停止并保存
+            elif name == "close":
+                self._stop_gif(save=False)
+            return
         if getattr(self, "_longshot", False):
             if name == "save":
                 self._save_longshot()      # 长截图另存为：选位置 → 保存 → 关闭
@@ -671,6 +737,8 @@ class CaptureOverlay(QWidget):
             self._cancel()
         elif name == "longshot":
             self._enter_longshot()
+        elif name == "gif":
+            self._enter_gif()
 
     # ------------------------------------------------ 标注
     def _begin_text(self, pos, edit_index=None, initial=""):
@@ -829,6 +897,133 @@ class CaptureOverlay(QWidget):
             p.setPen(QPen(Qt.white, 1))
             p.drawText(QRect(c - QPoint(11, 11), QSize(22, 22)), Qt.AlignCenter,
                        str(ann.get("num", 1)))
+
+    # ------------------------------------------------ GIF 录制（选区固定，10fps）
+    def _enter_gif(self):
+        if self._sel.isNull() or self._longshot:
+            return
+        self._gif = True
+        self._tool = None
+        self.toolbar.highlight_tool("gif")
+        self._gif_frames = []
+        self._gif_full = False
+        self._gif_t0 = time.monotonic()
+        self._make_gif_bar()
+        # 录制期间背景解锁：只留选区边框和工具栏，选区外实时桌面
+        ring = QRegion(self._sel.adjusted(-4, -4, 4, 4)) - QRegion(self._sel)
+        ring += QRegion(self.toolbar.geometry())
+        self.setMask(ring)
+        if self._gif_timer is None:
+            self._gif_timer = QTimer(self, interval=100)
+            self._gif_timer.timeout.connect(self._gif_tick)
+        if self._gif_start_timer is None:
+            self._gif_start_timer = QTimer(self)
+            self._gif_start_timer.setSingleShot(True)
+            self._gif_start_timer.timeout.connect(self._gif_begin)
+        self._gif_start_timer.start(100)      # 等镂空上屏，避免抓到自己
+        self.activateWindow()
+        self.setFocus()
+
+    def _make_gif_bar(self):
+        self._gif_bar = GifBar()
+        r = self._sel.translated(self._origin)
+        geo = self._screen.geometry()
+        x = r.right() + 16
+        if x + 220 > geo.right():
+            x = r.left() - 230
+        self._gif_bar.move(max(4, x), max(4, r.top()))
+        self._gif_bar.on_stop = lambda: self._stop_gif(save=True)
+        self._gif_bar.on_cancel = lambda: self._stop_gif(save=False)
+        self._gif_bar.set_status("● 准备录制…")
+        self._gif_bar.show()
+        self._place_toolbar()
+
+    def _gif_begin(self):
+        if not self._gif:
+            return
+        self._gif_t0 = time.monotonic()
+        self._gif_timer.start()
+        self._gif_tick()
+
+    def _gif_tick(self):
+        if not self._gif or self._gif_full:
+            return
+        cur, _ = self._grab_region()
+        h, w = cur.shape[:2]
+        n = len(self._gif_frames)
+        if n >= self._gif_max_frames or (n + 1) * h * w * 3 > self._gif_max_bytes:
+            self._gif_full = True
+            self._gif_timer.stop()
+            if self._gif_bar:
+                self._gif_bar.set_status(f"● 已到上限 · {n} 帧，点停止保存")
+            return
+        self._gif_frames.append(cur)
+        if self._gif_bar:
+            el = int(time.monotonic() - self._gif_t0)
+            self._gif_bar.set_status(f"● 录制中 {el // 60:02d}:{el % 60:02d} · {n + 1} 帧")
+
+    @staticmethod
+    def _encode_gif(frames, path):
+        """Pillow 编码：10fps、无限循环。帧为 HxWx3 uint8 RGB。"""
+        from PIL import Image
+        imgs = [Image.fromarray(f) for f in frames]
+        imgs[0].save(path, save_all=True, append_images=imgs[1:],
+                     duration=100, loop=0, optimize=True)
+
+    def _stop_gif(self, save=True):
+        if not getattr(self, "_gif", False):
+            return
+        if self._gif_timer:
+            self._gif_timer.stop()
+        if self._gif_start_timer:
+            self._gif_start_timer.stop()
+        frames = self._gif_frames
+        if not save or not frames:
+            self._exit_gif()
+            return
+        d = os.path.join(os.path.expanduser("~"), "Pictures", "SnapPin")
+        os.makedirs(d, exist_ok=True)
+        default = os.path.join(d, "GIF_" + time.strftime("%Y-%m-%d_%H%M%S") + ".gif")
+        path, _ = QFileDialog.getSaveFileName(self, "保存 GIF", default, "GIF 动图 (*.gif)")
+        if not path:
+            if self._gif_timer and not self._gif_full:   # 取消保存：继续录
+                self._gif_timer.start()
+                if self._gif_bar:
+                    self._gif_bar.set_status("● 录制中…")
+            return
+        if not os.path.splitext(path)[1]:
+            path += ".gif"
+        if self._gif_bar:
+            self._gif_bar.set_status("● 正在生成 GIF…")
+            QApplication.processEvents()
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            self._encode_gif(frames, path)
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, "GIF 生成失败", str(e))
+            self._exit_gif()
+            return
+        QApplication.restoreOverrideCursor()
+        self.sig_saved.emit(path)
+        self._exit_gif()
+        self.close()
+
+    def _exit_gif(self):
+        if getattr(self, "_gif", False):
+            self._gif = False
+            if self._gif_timer:
+                self._gif_timer.stop()
+            if self._gif_start_timer:
+                self._gif_start_timer.stop()
+            self.clearMask()
+            if self._gif_bar:
+                self._gif_bar.on_stop = None
+                self._gif_bar.on_cancel = None
+                self._gif_bar.close()
+                self._gif_bar = None
+            self._gif_frames = []
+            self._gif_full = False
 
     # ------------------------------------------------ 长截图（透明洞 + 定时抓屏拼接）
     def _enter_longshot(self):
@@ -1430,6 +1625,7 @@ class CaptureOverlay(QWidget):
     def closeEvent(self, ev):
         # 任何关闭路径都要收尾长截图：停定时器、关预览窗——
         # 否则覆盖层(WA_DeleteOnClose)销毁后预览窗成孤儿，按钮回调全指向已删除对象
+        self._exit_gif()
         self._exit_longshot()
         if self._toolbar is not None:
             self._toolbar.close()
@@ -1477,10 +1673,11 @@ class CaptureOverlay(QWidget):
     def paintEvent(self, _):
         p = QPainter(self)
         p.drawPixmap(0, 0, self._dark)      # 预暗化底图：一次位块拷贝
-        if getattr(self, "_longshot", False):
+        if getattr(self, "_longshot", False) or getattr(self, "_gif", False):
             # 边框画成紧贴洞口的实心色带（洞内被 mask 镂空，只有洞外可见）：
             # adjusted(-2)+宽4 → 恰好覆盖 [sel边缘, sel边缘+4]，滚动时始终可见
-            p.setPen(QPen(QColor(ACCENT), 4))
+            color = "#F53F3F" if getattr(self, "_gif", False) else ACCENT
+            p.setPen(QPen(QColor(color), 4))
             p.setBrush(Qt.NoBrush)
             p.drawRect(self._sel.adjusted(-2, -2, 2, 2))
             return
@@ -1815,5 +2012,29 @@ if __name__ == "__main__":
     assert (np.abs(final7 - expect7).mean(axis=1) <= 2).all(), \
         "上下滚扩展后长图必须逐行等于文档（零错位零重复）"
     ov7._exit_longshot()
+    # ---- GIF 录制：选区固定 / 背景解锁 / 帧采集 / 取消 / 编码
+    ov8 = CaptureOverlay(app.primaryScreen(), config.load())
+    ov8._sel = QRect(40, 40, 120, 90)
+    ov8._enter_gif()
+    assert ov8._gif and ov8._gif_bar is not None, "进入 GIF 录制应创建状态条"
+    assert not ov8.mask().contains(ov8._sel.center()), "GIF 录制选区必须镂空"
+    assert not ov8.mask().contains(QPoint(2, 2)), "GIF 录制背景必须解锁"
+    ov8._grab_region = lambda: (np.full((90, 120, 3), 180, np.uint8),
+                                np.zeros((90, 120), np.int16))
+    ov8._gif_begin()
+    assert len(ov8._gif_frames) == 1, "开始录制应立即抓首帧"
+    ov8._gif_tick()
+    assert len(ov8._gif_frames) == 2, "定时抓帧应追加"
+    ov8._stop_gif(save=False)
+    assert not ov8._gif and ov8._gif_bar is None and not ov8._gif_frames, \
+        "取消录制应释放状态条与帧"
+    import tempfile
+    gif_path = os.path.join(tempfile.gettempdir(), "snappin_gif_selftest.gif")
+    ov8._encode_gif([np.full((30, 40, 3), i * 60, np.uint8) for i in range(3)], gif_path)
+    from PIL import Image
+    with Image.open(gif_path) as im:
+        assert im.n_frames == 3, "GIF 应包含 3 帧"
+        assert im.size == (40, 30)
+    os.remove(gif_path)
     print("capture 自测通过: 惰性马赛克/工具栏/预暗化绘制/长截图守卫收尾/彩色拼接/"
           "悬浮件纹理判定/锚定条带对齐/仿微信回归/上下滚去重/缓冲扩容截断/预览防抖 全部 OK")
