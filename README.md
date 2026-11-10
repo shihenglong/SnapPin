@@ -106,6 +106,30 @@ PaddleOCR ONNX 模型 + onnxruntime 进程内推理，缺依赖时自动回退 R
 | `(x/255-0.5)/0.5`（改造前） | 0.971 |
 | ImageNet 均值方差（**采用**） | **0.987** |
 
+### 文字图层（PixPin `OcrTextItemLayer` 复刻）
+
+`ocrtext_layer.py` 按逆向结果复刻 PixPin 的文字图层，不是自绘近似：
+
+| PixPin | 地址 | 本模块 |
+|---|---|---|
+| `OcrGraphicsTextItem` 构造 | `0x14005e160` | `OcrGraphicsTextItem.__init__` |
+| 选字交互（模式码 1..7） | `0x14005f0f0` | `OcrTextItemLayer.hit_test()` |
+| 设置字符区间 `(selStart, selEnd)` | `0x14005f8a0` | `set_selection()` |
+| 四边形上**二分**定位字符 | `0x14005f210` | `char_at()` |
+| 文本回收（遍历 childItems + 动态转换） | `0x140060100` | `selection_ranges()` |
+
+与旧实现的关键差别（也正是这次"抄"的重点）：
+
+- 每个识别块是 **QGraphicsItem**，自带四角坐标 + 文本 + 置信度（PixPin 的 `+0x48`/`+0x68`/`+0x70`）；
+- 选中态是**字符索引区间**，不是逐字符矩形集合；
+- 字符位置由**四边形插值**算出（斜排文本同样准确），不是"均分宽度"；
+- 命中字符用**二分**，不是线性扫描；
+- 高亮色沿用 PixPin 实测值 `QColor(0x33,0x99,0xff,0x7f)`。
+
+翻译链完全没动：`_set_boxes()` 同时喂 `_ocr_boxes`（给翻译用的 `_blocks`/`_build_replaced`）
+与文字图层（给选字用的四角坐标），所以「右键 → 翻译（替换原图）」照旧，
+选字高亮也从"另画一遍"变成图层自己绘制。
+
 ## GIF 录制
 
 - **工具栏 GIF 按钮**：选区固定、背景解锁，10fps 录制，最长 30 秒 / 300 帧。
