@@ -344,9 +344,12 @@ _GIF_RESULTS = []          # 顶层窗口无 parent，必须持有引用防 GC
 class GifResult(QWidget):
     """GIF 结果：钉在桌面，点击画面播放/暂停，保存或复制后关闭。"""
 
-    def __init__(self, path: str, pos: QPoint):
+    def __init__(self, path: str, pos: QPoint, frames=None):
         super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self._path = path
+        self._frames = frames or None      # 原始像素帧：预览所见即所得
+        self._idx = -1
+        self._timer = None
         self._press = None
         self._win_pos = None
         self._dragging = False
@@ -357,17 +360,25 @@ class GifResult(QWidget):
         self.lab = QLabel()
         self.lab.setAlignment(Qt.AlignCenter)
         self.lab.setStyleSheet("background:#111317;border-radius:6px;")
-        self.movie = QMovie(path)
-        self.movie.jumpToFrame(0)
-        img = self.movie.currentImage()
-        w, h = max(1, img.width()), max(1, img.height())
+        if self._frames:
+            h, w = self._frames[0].shape[:2]
+        else:
+            self.movie = QMovie(path)
+            self.movie.jumpToFrame(0)
+            img = self.movie.currentImage()
+            w, h = max(1, img.width()), max(1, img.height())
         scr = QApplication.screenAt(pos) or QApplication.primaryScreen()
         avail = scr.availableGeometry()
         scale = min(1.0, max(1, avail.width() - 80) / w, max(1, avail.height() - 120) / h)
         self._disp = QSize(max(1, int(w * scale)), max(1, int(h * scale)))
-        self.movie.setScaledSize(self._disp)
+        if self._frames:
+            self.lab.setScaledContents(True)
+            self._timer = QTimer(self, interval=100)
+            self._timer.timeout.connect(self._next_frame)
+        else:
+            self.movie.setScaledSize(self._disp)
+            self.lab.setMovie(self.movie)
         self.lab.setFixedSize(self._disp)
-        self.lab.setMovie(self.movie)
         lay.addWidget(self.lab)
         self.overlay = _GifPlayOverlay(self.lab)
         self.overlay.setGeometry(self.lab.rect())
@@ -413,13 +424,28 @@ class GifResult(QWidget):
         y = min(max(avail.top() + 8, pos.y()),
                 max(avail.top() + 8, avail.bottom() - self.height() - 8))
         self.move(x, y)
-        self.movie.start()
-        self.movie.stop()            # 停在第 1 帧，点击后开始预览
+        if self._frames:
+            self._next_frame()      # 停在第 1 帧，点击后开始预览
+        else:
+            self.movie.start()
+            self.movie.stop()
         self.show()
         _GIF_RESULTS.append(self)
 
+    def _next_frame(self):
+        if not self._frames:
+            return
+        self._idx = (self._idx + 1) % len(self._frames)
+        f = self._frames[self._idx]
+        h, w = f.shape[:2]
+        self.lab.setPixmap(QPixmap.fromImage(
+            QImage(f.data, w, h, w * 3, QImage.Format_RGB888)))
+
     def _play(self):
-        self.movie.start()
+        if self._frames:
+            self._timer.start()
+        else:
+            self.movie.start()
         self.overlay.hide()
 
     def mousePressEvent(self, e):
@@ -437,8 +463,13 @@ class GifResult(QWidget):
 
     def mouseReleaseEvent(self, e):
         if self._press is not None and not self._dragging:
-            if self.movie.state() == QMovie.Running:
-                self.movie.setPaused(True)
+            running = self._timer.isActive() if self._frames else \
+                self.movie.state() == QMovie.Running
+            if running:
+                if self._frames:
+                    self._timer.stop()
+                else:
+                    self.movie.setPaused(True)
                 self.overlay.show()
                 self.overlay.raise_()
             else:
@@ -477,8 +508,13 @@ class GifResult(QWidget):
         self.close()
 
     def closeEvent(self, ev):
-        self.movie.stop()
-        self.movie.setFileName("")
+        if self._timer:
+            self._timer.stop()
+        if self._frames:
+            self._frames = None
+        elif hasattr(self, "movie"):
+            self.movie.stop()
+            self.movie.setFileName("")
         if self in _GIF_RESULTS:
             _GIF_RESULTS.remove(self)
         try:
@@ -1334,24 +1370,22 @@ class CaptureOverlay(QWidget):
 
     @staticmethod
     def _encode_gif(frames, path):
-        """Pillow 编码：10fps、无限循环。从全片采样构建统一 256 色调色板，
-        避免逐帧独立量化造成的闪烁，也避免只取首帧导致后续偏色。"""
+        """Pillow 编码：10fps、无限循环。用全片原始像素采样构建统一的 256 色
+        调色板（缩略图采样会把深色界面的高饱和色混成灰），MAXCOVERAGE 按
+        覆盖率分配配额，彩色元素更准；optimize 关闭，避免 Pillow 重排调色板
+        造成帧间色偏。"""
         from PIL import Image
-        step = max(1, len(frames) // 12)
-        sample = frames[::step][:12]
-        tw, th = 80, 45
-        cols = min(4, len(sample))
-        rows = max(1, math.ceil(len(sample) / cols))
-        canvas = Image.new("RGB", (tw * cols, th * rows), (0, 0, 0))
-        for i, f in enumerate(sample):
-            canvas.paste(Image.fromarray(f).resize((tw, th)),
-                         ((i % cols) * tw, (i // cols) * th))
-        base = canvas.quantize(colors=256, method=Image.Quantize.MEDIANCUT)
+        h, w = frames[0].shape[:2]
+        sy, sx = max(1, h // 16), max(1, w // 16)
+        strip = np.concatenate([np.ascontiguousarray(f[::sy, ::sx]) for f in frames],
+                               axis=0)
+        base = Image.fromarray(strip).quantize(
+            colors=256, method=Image.Quantize.MAXCOVERAGE)
         imgs = [Image.fromarray(f).quantize(
                     palette=base, dither=Image.Dither.FLOYDSTEINBERG)
                 for f in frames]
         imgs[0].save(path, save_all=True, append_images=imgs[1:],
-                     duration=100, loop=0, optimize=True)
+                     duration=100, loop=0, optimize=False)
 
     def _stop_gif(self, save=True):
         if not getattr(self, "_gif", False):
@@ -1384,7 +1418,7 @@ class CaptureOverlay(QWidget):
         self._exit_gif()
         self.close()
         try:
-            self._gif_result = GifResult(path, glob.topLeft())
+            self._gif_result = GifResult(path, glob.topLeft(), frames)
         except Exception as e:
             QMessageBox.warning(None, "GIF 预览失败", str(e))
 
@@ -2502,7 +2536,10 @@ if __name__ == "__main__":
     assert res.overlay.isVisible(), "默认应显示播放遮罩"
     res._play()
     assert not res.overlay.isVisible(), "点击播放后遮罩应消失"
-    res.movie.setPaused(True)
+    if res._frames:
+        res._timer.stop()
+    else:
+        res.movie.setPaused(True)
     res.overlay.show()
     res.close()
     assert res not in _GIF_RESULTS
