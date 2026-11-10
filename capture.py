@@ -140,6 +140,7 @@ class LongshotPreview(QWidget):
         self.setWindowTitle("SnapPin 长截图预览")
         self.on_finish = None
         self.on_cancel = None
+        self.on_auto = None
         col = QVBoxLayout(self)
         col.setContentsMargins(6, 6, 6, 6)
         col.setSpacing(5)
@@ -154,6 +155,20 @@ class LongshotPreview(QWidget):
         self.status.setStyleSheet("color:#C9CDD4;font-size:10px;background:transparent;")
         self.status.hide()
         col.addWidget(self.status)
+        auto_row = QHBoxLayout()
+        self.btn_auto = QPushButton("自动滚动")
+        self.btn_auto.setFixedHeight(28)
+        self.btn_auto.setCursor(Qt.PointingHandCursor)
+        self.btn_auto.setFocusPolicy(Qt.NoFocus)
+        self.btn_auto.setToolTip("程序自动向下滚动并逐段拼接，滚动更稳")
+        self.btn_auto.setStyleSheet(
+            "QPushButton{background:#2B3038;color:#8FB8FF;border:1px solid #3A4049;"
+            "border-radius:7px;font-size:12px;font-weight:600;}"
+            "QPushButton:hover{background:#363C46;color:#FFFFFF;}"
+            "QPushButton:pressed{background:#242930;}")
+        self.btn_auto.clicked.connect(lambda: self.on_auto and self.on_auto())
+        auto_row.addWidget(self.btn_auto)
+        col.addLayout(auto_row)
         btns = QHBoxLayout()
         btns.setSpacing(8)
         btn_ok = QPushButton("完成")
@@ -187,7 +202,7 @@ class LongshotPreview(QWidget):
 
     def _apply_height(self, content_h: int):
         """按预览内容高度调整窗口高度，并夹在当前屏幕内。"""
-        total = content_h + 62                     # 边距6*2 + 间距5*2 + 状态14 + 按钮行28 + 余量
+        total = content_h + 96                     # 边距 + 状态 + 自动滚动行 + 完成/取消行
         scr = self.screen() or QApplication.primaryScreen()
         max_h = scr.availableGeometry().height() - 24 if scr else total
         self.setFixedHeight(max(96, min(total, max_h)))
@@ -195,6 +210,21 @@ class LongshotPreview(QWidget):
         g = scr.availableGeometry() if scr else None
         if g and self.y() + self.height() > g.bottom() - 4:
             self.move(self.x(), max(g.top() + 4, g.bottom() - self.height() - 4))
+
+
+    def set_auto(self, active: bool):
+        if active:
+            self.btn_auto.setText("停止滚动")
+            self.btn_auto.setStyleSheet(
+                "QPushButton{background:#F53F3F;color:#FFFFFF;border:none;"
+                "border-radius:7px;font-size:12px;font-weight:600;}"
+                "QPushButton:hover{background:#D93030;}")
+        else:
+            self.btn_auto.setText("自动滚动")
+            self.btn_auto.setStyleSheet(
+                "QPushButton{background:#2B3038;color:#8FB8FF;border:1px solid #3A4049;"
+                "border-radius:7px;font-size:12px;font-weight:600;}"
+                "QPushButton:hover{background:#363C46;color:#FFFFFF;}")
 
     def set_pix(self, pix: QPixmap):
         """内容越长预览越高，达到上限后整体等比缩小（不再一味变小变窄）。
@@ -516,6 +546,10 @@ class CaptureOverlay(QWidget):
         self._ls_preview_h = 0
         self._ls_preview_t = 0.0
         self._preview = None
+        self._ls_auto = False
+        self._ls_auto_timer = None
+        self._ls_auto_last_len = 0
+        self._ls_auto_stall = 0
         self._gif = False
         self._gif_frames = []
         self._gif_t0 = 0.0
@@ -1414,6 +1448,57 @@ class CaptureOverlay(QWidget):
         self._ls_preview_h = 0
         self._ls_preview_t = 0.0
 
+    def _toggle_auto_scroll(self):
+        """自动滚动：程序按固定节奏向下滚，每步等页面停稳再拼，避免赌用户速度。"""
+        if getattr(self, "_ls_auto", False):
+            self._stop_auto_scroll()
+            return
+        if self._ls_stitched is None:
+            return
+        self._ls_auto = True
+        self._ls_auto_last_len = self._ls_len
+        self._ls_auto_stall = 0
+        if self._preview:
+            self._preview.set_auto(True)
+        if self._ls_auto_timer is None:
+            self._ls_auto_timer = QTimer(self, interval=600)
+            self._ls_auto_timer.timeout.connect(self._auto_tick)
+        self._ls_auto_timer.start()
+        self._auto_scroll_step()
+
+    def _auto_scroll_step(self):
+        g = self._sel.translated(self._origin)
+        c = g.center()
+        try:
+            user32.SetCursorPos(c.x(), c.y())
+            user32.mouse_event(0x0800, 0, 0, (-240) & 0xFFFFFFFF, 0)
+        except Exception:
+            pass
+
+    def _auto_tick(self):
+        if not self._ls_auto:
+            return
+        if self._ls_len > self._ls_auto_last_len:
+            self._ls_auto_last_len = self._ls_len
+            self._ls_auto_stall = 0
+        else:
+            self._ls_auto_stall += 1
+            if self._ls_auto_stall >= 2:      # 连续两拍没有新内容：到底/无法继续
+                self._stop_auto_scroll()
+                return
+        self._auto_scroll_step()
+
+    def _stop_auto_scroll(self):
+        if getattr(self, "_ls_auto", False):
+            self._ls_auto = False
+            if getattr(self, "_ls_auto_timer", None):
+                self._ls_auto_timer.stop()
+            if self._preview:
+                try:
+                    self._preview.set_auto(False)
+                except RuntimeError:
+                    pass
+
     def _ls_begin(self):
         """首帧抓取：由 _enter_longshot 延迟触发，确保镂空已上屏。"""
         if not self._longshot or self._ls_stitched is not None:
@@ -1793,6 +1878,7 @@ class CaptureOverlay(QWidget):
             x = r.left() - 226
         self._preview.move(max(4, x), max(4, r.top()))
         self._preview.on_finish = self._finish_longshot
+        self._preview.on_auto = self._toggle_auto_scroll
         self._preview.on_cancel = self._on_esc
         self._update_preview()
         self._preview.show()
@@ -1884,6 +1970,7 @@ class CaptureOverlay(QWidget):
     def _exit_longshot(self):
         if getattr(self, "_longshot", False):
             self._longshot = False
+            self._stop_auto_scroll()
             if getattr(self, "_ls_timer", None):
                 self._ls_timer.stop()
             if getattr(self, "_ls_start_timer", None):
@@ -1892,6 +1979,7 @@ class CaptureOverlay(QWidget):
             if self._preview:
                 # 先摘回调再关窗：防覆盖层销毁后预览窗按钮仍触发旧槽
                 self._preview.on_finish = None
+                self._preview.on_auto = None
                 self._preview.on_cancel = None
                 self._preview.close()
                 self._preview = None
@@ -2237,6 +2325,14 @@ if __name__ == "__main__":
     ov4._ls_append(band[:32])
     ov4._update_preview()
     assert len(called) == 1, "新增行达到阈值应刷新预览"
+    assert ov4._preview.on_auto is not None, "预览窗应挂接自动滚动"
+    ov4._auto_scroll_step = lambda: None
+    ov4._toggle_auto_scroll()
+    assert ov4._ls_auto and ov4._ls_auto_timer.isActive(), "自动滚动应启动"
+    assert ov4._preview.btn_auto.text() == "停止滚动"
+    ov4._stop_auto_scroll()
+    assert not ov4._ls_auto and not ov4._ls_auto_timer.isActive(), \
+        "自动滚动应停止"
     ov4._exit_longshot()
 
     # ---- 上限截断：保头部、丢溢出（与旧 vstack 语义一致），满后再拼整体丢弃
