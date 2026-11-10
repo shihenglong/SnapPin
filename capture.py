@@ -197,7 +197,7 @@ class LongshotPreview(QWidget):
         self.setStyleSheet(
             "LongshotPreview{background:#1E2126;border:2px solid #2E7CF6;"
             "border-radius:9px;}")
-        self.setFixedWidth(196)
+        self.setFixedWidth(232)
         self._apply_height(60)
 
     def _apply_height(self, content_h: int):
@@ -226,10 +226,11 @@ class LongshotPreview(QWidget):
                 "border-radius:7px;font-size:12px;font-weight:600;}"
                 "QPushButton:hover{background:#363C46;color:#FFFFFF;}")
 
-    def set_pix(self, pix: QPixmap):
+    def set_pix(self, pix: QPixmap, note: str = ""):
         """内容越长预览越高，达到上限后整体等比缩小（不再一味变小变窄）。
 
-        预览用 FastTransformation：每 300ms 对不断增长的大图做平滑缩放太卡，
+        缩放用 SmoothTransformation：Fast 的最近邻采样会让文字出现锯齿与
+        横条纹，看着就像“拖影”，实测 1000×5000 图仅 1.1ms，可放心用。
         最终导出仍用原始数据，不受影响。
         """
         if pix.isNull():
@@ -237,10 +238,10 @@ class LongshotPreview(QWidget):
             self.status.hide()
             self._apply_height(60)
             return
-        self.status.setText(f"{pix.width()} × {pix.height()} px")
+        self.status.setText(f"{pix.width()} × {pix.height()} px{note}")
         self.status.show()
         max_h = min(self.MAX_CONTENT_H, 60000)
-        scaled = pix.scaled(184, max_h, Qt.KeepAspectRatio, Qt.FastTransformation)
+        scaled = pix.scaled(220, max_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.lab.setPixmap(scaled)
         self._apply_height(scaled.height() + 4)
 
@@ -543,6 +544,7 @@ class CaptureOverlay(QWidget):
         self._ls_cap = 0
         self._ls_full = False
         self._ls_ref_gray = None
+        self._ls_base_gray = None
         self._ls_preview_h = 0
         self._ls_preview_t = 0.0
         self._preview = None
@@ -550,6 +552,7 @@ class CaptureOverlay(QWidget):
         self._ls_auto_timer = None
         self._ls_auto_last_len = 0
         self._ls_auto_stall = 0
+        self._ls_rejected = 0
         self._gif = False
         self._gif_frames = []
         self._gif_t0 = 0.0
@@ -1458,10 +1461,11 @@ class CaptureOverlay(QWidget):
         self._ls_auto = True
         self._ls_auto_last_len = self._ls_len
         self._ls_auto_stall = 0
+        self._ls_rejected = 0
         if self._preview:
             self._preview.set_auto(True)
         if self._ls_auto_timer is None:
-            self._ls_auto_timer = QTimer(self, interval=600)
+            self._ls_auto_timer = QTimer(self, interval=400)
             self._ls_auto_timer.timeout.connect(self._auto_tick)
         self._ls_auto_timer.start()
         self._auto_scroll_step()
@@ -1479,14 +1483,16 @@ class CaptureOverlay(QWidget):
         if not self._ls_auto:
             return
         if self._ls_len > self._ls_auto_last_len:
+            # 上一步已经拼好，才滚下一步：避免“页面还没稳就继续滚”丢内容
             self._ls_auto_last_len = self._ls_len
             self._ls_auto_stall = 0
+            self._auto_scroll_step()
         else:
             self._ls_auto_stall += 1
-            if self._ls_auto_stall >= 2:      # 连续两拍没有新内容：到底/无法继续
+            if self._ls_auto_stall >= 4:      # 等 1.6s 仍无新内容：到底/无法继续
                 self._stop_auto_scroll()
                 return
-        self._auto_scroll_step()
+            # 不滚动，继续等页面稳定与对齐成功
 
     def _stop_auto_scroll(self):
         if getattr(self, "_ls_auto", False):
@@ -1515,6 +1521,10 @@ class CaptureOverlay(QWidget):
         self._ls_stitched = self._ls_buf[:H0]
         self._ls_prev, self._ls_prev_gray = prev, prev_gray
         self._ls_ref_gray = prev_gray
+        # 首帧基线：悬浮固定件在首帧里就在视口原位，滚动再远也不移动。
+        # 纯色块（粗体文字/卡片）与首帧同位置多半不同，靠它把误判挡掉——
+        # 误判一旦成立，_fill_static 会把整行插值成横向条纹（用户所见的拖影）。
+        self._ls_base_gray = prev_gray.copy()
         self._ls_view = 0
         self._update_preview(force=True)
 
@@ -1542,7 +1552,7 @@ class CaptureOverlay(QWidget):
     # 不参与任何判定，假匹配失去了滋生土壤；上滚对称处理，来回滚零重复。
     _STRIP = 32            # 锚定条带高度
     _STRIP_STD = 8.0       # 条带纹理度门槛（行间标准差，低于视为均匀不可锚定）
-    _OV_RATIO = 0.75       # 重叠区一致行占比门槛（容纳悬浮按钮/表情动画）
+    _OV_RATIO = 0.97       # 重叠区内容行一致占比门槛：差 1~2 行的错位也会造成局部重影
 
     @staticmethod
     def _texture_cols(strip, cap=96):
@@ -1708,7 +1718,7 @@ class CaptureOverlay(QWidget):
         # 平滑滚动/流式渲染，拼进长图就是用户反复看到的横向拖影。宁丢勿糊。
         d_prev = np.abs(cur_gray[::2, ::2] - prev_gray[::2, ::2])
         d_ref = np.abs(cur_gray[::2, ::2] - ref_gray[::2, ::2])
-        settled = float((d_prev > 0).mean()) < 0.0002
+        settled = float((d_prev > 0).mean()) < 0.0001
         moved = float((d_ref > 2).mean()) >= 0.002
         if settled and moved:
             self._ls_align(cur, cur_gray)
@@ -1734,6 +1744,7 @@ class CaptureOverlay(QWidget):
             top = self._ls_view - u_s
             shift = -u_s
         else:
+            self._ls_rejected += 1     # 对不齐的帧直接丢弃（宁缺勿糊）
             return
         H = cur_gray.shape[0]
         fixed = np.zeros(H, dtype=bool)
@@ -1741,7 +1752,7 @@ class CaptureOverlay(QWidget):
             # 位移小于固定件最小高度时，固定件不可能进入本次新行（新增行
             # 只在视口最边缘），不检测也不填充；否则小位移下的纯色块会
             # 被整行误判并抹成拉丝（用户实测拖影）。
-            fixed = self._static_fixed(cur_gray, ref_gray, shift)
+            fixed = self._static_fixed(cur_gray, ref_gray, shift, self._ls_base_gray)
         if shift > 0:                       # 只消除会进入本次新尾行的固定件
             fixed[:H - shift] = False
         else:                               # 只消除会进入本次新头行的固定件
@@ -1820,7 +1831,7 @@ class CaptureOverlay(QWidget):
         self._ls_stitched = self._ls_buf[self._ls_off:self._ls_off + self._ls_len]
 
     @staticmethod
-    def _static_fixed(cur_gray, ref_gray, shift):
+    def _static_fixed(cur_gray, ref_gray, shift, base_gray=None):
         """检测悬浮固定件（回到底部↓/吸顶栏）。判据必须同时满足：
         1) 与参考帧同位置逐像素完全一致——固定件钉在视口；
         2) 与参考帧的滚动对应位置不一致——滚动内容会随位移移动。
@@ -1838,6 +1849,10 @@ class CaptureOverlay(QWidget):
         zone[:edge] = True
         zone[H - edge:] = True
         fixed = (same > 0.999) & textured & zone
+        if base_gray is not None and base_gray.shape == cur_gray.shape:
+            # 与首帧同位置也必须一致：固定件不动，滚动内容会换
+            same_base = (cur_gray[:, ::2] == base_gray[:, ::2]).mean(axis=1)
+            fixed &= same_base > 0.999
         ov = H - abs(int(shift))
         if shift > 0 and ov > 8:                  # 下滚：cur[:ov] 对应 ref[shift:]
             fixed[:ov] &= (cur_gray[:ov, ::2] != ref_gray[shift:shift + ov, ::2]
@@ -1905,7 +1920,8 @@ class CaptureOverlay(QWidget):
         h, w = c.shape[:2]
         data = c.tobytes()        # 必须持有引用：QImage 不拥有内存，临时 bytes
         img = QImage(data, w, h, w * 3, QImage.Format_RGB888)
-        self._preview.set_pix(QPixmap.fromImage(img))
+        self._preview.set_pix(QPixmap.fromImage(img),
+                              f" · 拒绝 {self._ls_rejected} 帧")
 
     def _longshot_pixmap(self) -> QPixmap:
         c = self._ls_stitched
@@ -2319,7 +2335,7 @@ if __name__ == "__main__":
     # ---- 预览节流防抖动：无新增行不重渲染，新增 ≥32 行才刷新
     ov4._update_preview(force=True)                   # 同步预览水位到当前长度
     called = []
-    ov4._preview.set_pix = lambda p: called.append(1)
+    ov4._preview.set_pix = lambda p, note="": called.append(1)
     ov4._update_preview()
     assert len(called) == 0, "无新增行不应重渲染预览"
     ov4._ls_append(band[:32])
