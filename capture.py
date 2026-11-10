@@ -12,7 +12,7 @@ from ctypes import wintypes
 from PySide6.QtCore import (QMimeData, QPoint, QRect, QRectF, QSize, Qt, QTimer,
                             QUrl, Signal)
 from PySide6.QtGui import (QBrush, QColor, QCursor, QFont, QIcon, QImage,
-                           QMovie, QRegion,
+                           QMovie, QPolygon, QRegion,
                            QKeySequence, QPainter, QPainterPath, QPen, QPixmap,
                            QShortcut)
 from PySide6.QtWidgets import (QApplication, QFileDialog, QGridLayout, QHBoxLayout,
@@ -262,6 +262,50 @@ class GifBar(QWidget):
         self.status.setText(text)
 
 
+# ---------------------------------------------------------------- GIF 播放遮罩
+class _GifPlayOverlay(QWidget):
+    """覆盖在 GIF 上的播放按钮层：点击播放，按住可拖动预览窗。"""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setCursor(Qt.PointingHandCursor)
+        self._press = None
+        self._win_pos = None
+        self._dragging = False
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(0, 0, 0, 70))
+        p.setRenderHint(QPainter.Antialiasing)
+        c = self.rect().center()
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(255, 255, 255, 230))
+        p.drawEllipse(c, 28, 28)
+        p.setBrush(QColor("#1E2126"))
+        p.drawPolygon(QPolygon([QPoint(c.x() - 8, c.y() - 13),
+                                QPoint(c.x() - 8, c.y() + 13),
+                                QPoint(c.x() + 13, c.y())]))
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._press = e.globalPosition().toPoint()
+            self._win_pos = self.window().pos()
+            self._dragging = False
+
+    def mouseMoveEvent(self, e):
+        if self._press is not None and e.buttons() & Qt.LeftButton:
+            d = e.globalPosition().toPoint() - self._press
+            if abs(d.x()) + abs(d.y()) > 3:
+                self._dragging = True
+                self.window().move(self._win_pos + d)
+
+    def mouseReleaseEvent(self, e):
+        if self._press is not None and not self._dragging:
+            self.window()._play()
+        self._press = None
+
+
 # ---------------------------------------------------------------- GIF 结果预览
 _GIF_RESULTS = []          # 顶层窗口无 parent，必须持有引用防 GC
 
@@ -272,6 +316,9 @@ class GifResult(QWidget):
     def __init__(self, path: str, pos: QPoint):
         super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self._path = path
+        self._press = None
+        self._win_pos = None
+        self._dragging = False
         self.setWindowTitle("SnapPin GIF 预览")
         lay = QVBoxLayout(self)
         lay.setContentsMargins(6, 6, 6, 6)
@@ -291,6 +338,10 @@ class GifResult(QWidget):
         self.lab.setFixedSize(self._disp)
         self.lab.setMovie(self.movie)
         lay.addWidget(self.lab)
+        self.overlay = _GifPlayOverlay(self.lab)
+        self.overlay.setGeometry(self.lab.rect())
+        self.overlay.show()
+        self.overlay.raise_()
         tip = QLabel("点击画面播放 / 暂停")
         tip.setAlignment(Qt.AlignHCenter)
         tip.setStyleSheet("color:#8A9099;font-size:10px;background:transparent;")
@@ -336,12 +387,32 @@ class GifResult(QWidget):
         self.show()
         _GIF_RESULTS.append(self)
 
+    def _play(self):
+        self.movie.start()
+        self.overlay.hide()
+
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
+            self._press = e.globalPosition().toPoint()
+            self._win_pos = self.pos()
+            self._dragging = False
+
+    def mouseMoveEvent(self, e):
+        if self._press is not None and e.buttons() & Qt.LeftButton:
+            d = e.globalPosition().toPoint() - self._press
+            if abs(d.x()) + abs(d.y()) > 3:
+                self._dragging = True
+                self.move(self._win_pos + d)
+
+    def mouseReleaseEvent(self, e):
+        if self._press is not None and not self._dragging:
             if self.movie.state() == QMovie.Running:
-                self.movie.pause()
+                self.movie.setPaused(True)
+                self.overlay.show()
+                self.overlay.raise_()
             else:
-                self.movie.start()
+                self._play()
+        self._press = None
 
     def _save(self):
         d = os.path.join(os.path.expanduser("~"), "Pictures", "SnapPin")
@@ -453,6 +524,7 @@ class CaptureOverlay(QWidget):
         self._gif_start_timer = None
         self._gif_full = False
         self._gif_size = None               # 统一帧尺寸（超内存预算时等比缩小）
+        self._gif_cursor = None
         self._gif_result = None
         self._gif_max_frames = 300          # 30s @ 10fps
         self._gif_max_bytes = 400 * 1024 * 1024
@@ -1038,6 +1110,7 @@ class CaptureOverlay(QWidget):
         self._gif_full = False
         self._gif_size = None
         self._gif_t0 = time.monotonic()
+        self._make_gif_cursor()
         self._make_gif_bar()
         # 录制期间背景解锁：只留选区边框和工具栏，选区外实时桌面
         ring = QRegion(self._sel.adjusted(-4, -4, 4, 4)) - QRegion(self._sel)
@@ -1075,6 +1148,34 @@ class CaptureOverlay(QWidget):
         self._gif_timer.start()
         self._gif_tick()
 
+    def _make_gif_cursor(self):
+        """缓存一个带白边的黑色箭头，录制时叠加到鼠标位置。"""
+        pm = QPixmap(26, 32)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        path = QPainterPath()
+        path.moveTo(1, 1)
+        path.lineTo(1, 23)
+        path.lineTo(6, 18)
+        path.lineTo(10, 28)
+        path.lineTo(14, 26)
+        path.lineTo(10, 16)
+        path.lineTo(18, 16)
+        path.closeSubpath()
+        p.setPen(QPen(QColor("#FFFFFF"), 2))
+        p.setBrush(QColor("#000000"))
+        p.drawPath(path)
+        p.end()
+        self._gif_cursor = pm
+
+    def _draw_gif_cursor(self, frame, x, y):
+        h, w = frame.shape[:2]
+        img = QImage(frame.data, w, h, w * 3, QImage.Format_RGB888)
+        p = QPainter(img)
+        p.drawPixmap(x - 1, y - 1, self._gif_cursor)
+        p.end()
+
     def _prepare_gif_frame(self, cur):
         """裁掉选区边缘 2px（防边框抗锯齿渗色），并按 30s 内存预算缩放。"""
         if cur.shape[0] > 6 and cur.shape[1] > 6:
@@ -1093,7 +1194,18 @@ class CaptureOverlay(QWidget):
         if not self._gif or self._gif_full:
             return
         cur, _ = self._grab_region()
+        orig_h, orig_w = cur.shape[:2]
         cur = self._prepare_gif_frame(cur)
+        pos = QCursor.pos()
+        g = self._sel.translated(self._origin)
+        mx = int((pos.x() - g.x()) * self._dpr) - 2
+        my = int((pos.y() - g.y()) * self._dpr) - 2
+        if self._gif_size:
+            h0, w0 = max(1, orig_h - 4), max(1, orig_w - 4)
+            mx = int(mx * self._gif_size[0] / w0)
+            my = int(my * self._gif_size[1] / h0)
+        if 0 <= mx < cur.shape[1] and 0 <= my < cur.shape[0]:
+            self._draw_gif_cursor(cur, mx, my)
         h, w = cur.shape[:2]
         n = len(self._gif_frames)
         if n >= self._gif_max_frames or (n + 1) * h * w * 3 > self._gif_max_bytes:
@@ -2174,6 +2286,10 @@ if __name__ == "__main__":
     assert ov8._gif and ov8._gif_bar is not None, "进入 GIF 录制应创建状态条"
     assert not ov8.mask().contains(ov8._sel.center()), "GIF 录制选区必须镂空"
     assert not ov8.mask().contains(QPoint(2, 2)), "GIF 录制背景必须解锁"
+    assert ov8._gif_cursor is not None, "录制应缓存鼠标指针"
+    cframe = np.zeros((60, 80, 3), np.uint8)
+    ov8._draw_gif_cursor(cframe, 10, 10)
+    assert cframe.any(), "鼠标指针应绘制到帧上"
     ov8._grab_region = lambda: (np.full((90, 120, 3), 180, np.uint8),
                                 np.zeros((90, 120), np.int16))
     ov8._gif_begin()
@@ -2191,6 +2307,11 @@ if __name__ == "__main__":
     assert not ov8._gif and ov8._gif_result is not None, "停止保存应生成预览窗"
     res = ov8._gif_result
     assert res in _GIF_RESULTS, "预览窗必须被持有，否则会被 GC 关闭"
+    assert res.overlay.isVisible(), "默认应显示播放遮罩"
+    res._play()
+    assert not res.overlay.isVisible(), "点击播放后遮罩应消失"
+    res.movie.setPaused(True)
+    res.overlay.show()
     res.close()
     assert res not in _GIF_RESULTS
     import tempfile
