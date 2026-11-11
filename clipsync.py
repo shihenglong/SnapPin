@@ -297,7 +297,6 @@ if __name__ == "__main__":
     import sys
     import tempfile
 
-    from PySide6.QtWidgets import QApplication
 
     from clip import ClipStore
 

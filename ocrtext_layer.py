@@ -24,7 +24,7 @@
 transform 负责，因此 item 内部完全不用管 zoom。
 """
 from PySide6.QtCore import QLineF, QPointF, QRectF, Qt
-from PySide6.QtGui import QBrush, QColor, QFont, QPen
+from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import QGraphicsItem
 
 # PixPin 实测：+0x88 = QColor(0x33,0x99,0xff,0x7f)

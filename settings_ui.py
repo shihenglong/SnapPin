@@ -845,7 +845,6 @@ class SettingsDialog(QDialog):
 
 if __name__ == "__main__":
     # 离屏自测：QT_QPA_PLATFORM=offscreen python settings_ui.py
-    import json
     import shutil
     import sys
     import tempfile

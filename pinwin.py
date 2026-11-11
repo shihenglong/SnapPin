@@ -820,7 +820,6 @@ if __name__ == "__main__":
     import sys
 
     import config
-    from PySide6.QtCore import QPoint
     from PySide6.QtGui import QPainter
     from PySide6.QtWidgets import QApplication
 

@@ -21,10 +21,10 @@ if sys.stderr is None:            # pythonw/打包 exe 无控制台：重定向�
 if sys.stderr is not None:
     faulthandler.enable()         # 崩溃栈也会写进日志
 
-from PySide6.QtCore import QObject, QPoint, QRect, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QObject, QRect, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QIcon, QPixmap
-from PySide6.QtWidgets import (QApplication, QMenu, QMessageBox, QSystemTrayIcon,
-                               QWidget)
+from PySide6.QtWidgets import (QApplication, QMenu, QMessageBox,
+                               QSystemTrayIcon)
 
 import config
 from icons import APP_ICON_SVG

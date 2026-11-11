@@ -393,7 +393,6 @@ class OcrPipeline:
 
 # ---------------------------------------------------------------- 自测
 if __name__ == "__main__":                                  # pragma: no cover
-    import tempfile
     from PIL import Image, ImageDraw, ImageFont
 
     if not available():

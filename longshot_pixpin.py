@@ -268,7 +268,6 @@ class PixPinLongShot:
 
 # ---------------------------------------------------------------- 自测
 if __name__ == "__main__":                               # pragma: no cover
-    import sys
 
     if cv2 is None:
         print("需要 opencv")

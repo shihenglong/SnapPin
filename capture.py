@@ -11,12 +11,11 @@ from ctypes import wintypes
 
 from PySide6.QtCore import (QMimeData, QPoint, QRect, QRectF, QSize, Qt, QTimer,
                             QUrl, Signal)
-from PySide6.QtGui import (QBrush, QColor, QCursor, QFont, QIcon, QImage,
+from PySide6.QtGui import (QBrush, QColor, QCursor, QFont, QImage,
                            QMovie, QPolygon, QRegion,
                            QKeySequence, QPainter, QPainterPath, QPen, QPixmap,
                            QShortcut)
-from PySide6.QtWidgets import (QApplication, QFileDialog, QFrame, QGridLayout,
-                               QHBoxLayout, QLabel, QMessageBox, QPushButton,
+from PySide6.QtWidgets import (QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QMessageBox, QPushButton,
                                QScrollArea, QTextEdit, QToolButton, QVBoxLayout,
                                QWidget, QGraphicsDropShadowEffect)
 
@@ -260,10 +259,9 @@ class LongshotPreview(QWidget):
         scr = self.screen() or QApplication.primaryScreen()
         g = scr.availableGeometry() if scr else None
         if self._hdir:
-            # 横向：面板宽度**从第一帧起就固定**（用户明确要求：不要先随内容
-            # 变宽、超过一定长度才固定住），内部滚动承接超长内容
+            # 横向：宽度随内容延伸（用户要求不固定），只夹在屏幕可用宽内
             avail = (g.width() - 60) if g else self.MAX_W
-            w = min(self.MAX_W, max(120, avail))
+            w = min(pix.width() + self.PAD, max(120, avail))
             self.setFixedSize(w, pix.height() + self.PAD)
         else:
             avail = (g.height() - 90) if g else self.MAX_H
@@ -360,6 +358,7 @@ class LongshotToolbar(QWidget):
             return b
 
         self.btn_pin = ibtn("pin", "钉到桌面")
+        self.btn_close = ibtn("close", "取消长截图 (Esc)")
         self.btn_save = ibtn("save", "保存为图片")
         self.btn_copy = ibtn("copy", "复制到剪贴板")
         self.btn_ok = ibtn("check", "完成并复制 (Enter)", "#FFFFFF")
@@ -367,7 +366,8 @@ class LongshotToolbar(QWidget):
             "QToolButton{border:none;border-radius:7px;background:#2E7CF6;}"
             "QToolButton:hover{background:#1E66E0;}"
             "QToolButton:pressed{background:#1A58C4;}")
-        for b in (self.btn_pin, self.btn_save, self.btn_copy, self.btn_ok):
+        # 按钮顺序与普通截图工具栏对齐（pin → close → save → copy）
+        for b in (self.btn_pin, self.btn_close, self.btn_save, self.btn_copy):
             row.addWidget(b)
         row.addWidget(self._sep())
         self.btn_dir = ibtn("dir_v", "切换到横向拼接")
@@ -376,8 +376,8 @@ class LongshotToolbar(QWidget):
         for b in (self.btn_dir, self.btn_up, self.btn_down):
             row.addWidget(b)
         row.addWidget(self._sep())
-        self.btn_close = ibtn("close", "取消长截图 (Esc)")
-        row.addWidget(self.btn_close)
+        # 主操作（完成并复制）放最右，蓝底高亮
+        row.addWidget(self.btn_ok)
         # 按钮 → 信号（漏接这组 connect 就是「点击全部无效」的根因）
         self.btn_pin.clicked.connect(self.sig_pin.emit)
         self.btn_save.clicked.connect(self.sig_save.emit)
@@ -2333,13 +2333,11 @@ class CaptureOverlay(QWidget):
 if __name__ == "__main__":
     # 离屏自测：QT_QPA_PLATFORM=offscreen python capture.py
     # 覆盖懒加载链路：马赛克底图/工具栏按需创建、窗口枚举独立于 show()
-    import os
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     import sys
 
     import config
     from PySide6.QtWidgets import QApplication
-
     app = QApplication(sys.argv)
     ov = CaptureOverlay(app.primaryScreen(), config.load())
     assert ov._toolbar is None and ov._mosaic_img is None, "重活应保持惰性"

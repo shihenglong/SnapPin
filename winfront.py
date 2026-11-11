@@ -58,7 +58,6 @@ def force_front(widget) -> bool:
 if __name__ == "__main__":
     # 真桌面自测（offscreen 无 Z 序，必须真窗口）：QT 不设 offscreen 直接跑本文件。
     # 模拟用户场景：后台进程（终端在前台）由 QTimer 弹设置窗 → 应自动到最前。
-    import os
     import sys
 
     from PySide6.QtCore import QTimer
