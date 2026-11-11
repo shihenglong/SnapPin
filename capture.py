@@ -1933,6 +1933,9 @@ class CaptureOverlay(QWidget):
             if int(self._pp.canvas.nbytes) > 150 * 1024 * 1024:
                 self._ls_full = True
         elif st == longshot_pixpin.ERR_BOTTOM:
+            # 无新内容（静止 / 滚回已捕获区）：长图不动，但用户视口回到
+            # 了长图行 off——预览跟随（PixPin 同样用该锚点同步视口）
+            self._ls_view = off
             self._ls_miss = getattr(self, "_ls_miss", 0) + 1
         else:
             self._ls_rejected += 1

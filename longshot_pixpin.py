@@ -107,8 +107,6 @@ class PixPinLongShot:
         self.has_ref = False          # inner+0xB8
         self.canvas = None            # 长图（RGB，纵向模式；横向为转置态）
         self.status = ERR_OK
-        self._prev_pipe = None        # 上一帧的管线态（固定带检测用）
-        self._fixed = None            # 固定带 (a, b)，None = 未检测/无
 
     # ------------------------------------------------------------ 工具
     def _to_pipeline(self, frame_rgb: np.ndarray) -> np.ndarray:
@@ -155,13 +153,13 @@ class PixPinLongShot:
             return ERR_NO_MATCH, 0, 0.0
         rows_ref = int(self.m_prof.shape[0])
 
-        # PixPin: last_offset 仍是初值（首帧之后第一次）时走 LAB_1400ce69a。
-        # 该分支语义未确证；这里按「窗口取全量程」处理，否则第二帧必失败。
-        if self.last_offset == INIT_OFFSET or rows_ref < self.block * 3:
+        # `0x1400ce530`：参考不足 3 帧高或尚无锚点 → 全量窗口；否则在
+        # [last-block, min(rows_ref, last+2*block)) 内搜索。
+        if self.last_offset == INIT_OFFSET or rows_ref < n * 3:
             start, end = 0, rows_ref
         else:
-            start = max(0, self.last_offset - self.block)
-            end = min(rows_ref, self.last_offset + 2 * self.block)
+            start = max(0, self.last_offset - n)
+            end = min(rows_ref, self.last_offset + 2 * n)
         if end - start < 8:
             return ERR_NO_MATCH, 0, 0.0
 
@@ -191,17 +189,22 @@ class PixPinLongShot:
                 return ERR_NO_MATCH, 0, float(conf)
             delta = int(vals[order[0]])
 
-        # 绝对位移 = 窗口起点 + 冠军 Δ，**保留符号**。
-        # 逐条对齐 0x1400CE530：
-        #   *param_3 = iVar11;                    → 负值原样作为输出位移
-        #   if (iVar11 < 0) { ...; iVar11 = 0; }  → 只是把搜索锚点归 0
-        #   merge(dst, src, *param_3)             → 负 offset 走前插
-        #   （merge 0x1400CDA00 开头 if (param_3 < 0) param_3 = -param_3）
-        # 之前我把「锚点归 0」误读成「位移被丢弃」，才导致上滚/左滚无效。
+        # 绝对位移 = 窗口起点 + 冠军 Δ（`iVar11 = local_210 + *param_3`）。
+        # offset 是「当前帧首行在长图中的绝对行号」：
+        #   *param_3 = iVar11        → 原样输出（负值由 merge 前插）
+        #   iVar11 < 0 → anchor = rows_ref − offset，锚点写 0
+        #   否则       → anchor = 帧高 + offset，锚点写 offset
         offset = start + delta
-        self.last_offset = offset if offset >= 0 else 0
-        if offset == 0:
-            return ERR_BOTTOM, 0, float(conf)      # 位移为 0：没有新内容
+        if offset < 0:
+            new_anchor = rows_ref - offset
+            self.last_offset = 0
+        else:
+            new_anchor = n + offset
+            self.last_offset = offset
+        # `if (param_1[6] < local_190)`：锚点没有超出参考长度 = 无新内容
+        # （静止帧 / 滚回已捕获区）→ status 1，不拼。
+        if rows_ref >= new_anchor:
+            return ERR_BOTTOM, offset, float(conf)
         return ERR_OK, offset, float(conf)
 
     # ------------------------------------------------------------ 拼接
@@ -210,11 +213,12 @@ class PixPinLongShot:
         return self.canvas
 
     def compose_pipe(self, pipe: np.ndarray, offset: int):
-        """把管线态当前帧按绝对位移 offset 写入长图（`0x1400CDFB0` + `0x1400CDA00`）。
+        """`0x1400CDFB0` + `0x1400CDA00`：按锚点 offset 合并新帧。
 
-        语义与 PixPin 的逐行 memcpy 一致：目标行 = 源行 + offset，重叠部分被
-        新帧覆盖、没有单独的相似度去重；只是这里只写「新增段」，避免每帧
-        整图拷贝。
+        PixPin 语义（mergeInto）：dst 行 = src 行 + offset。正锚点时旧画布
+        保留 [0, (old_h+offset)/2) 段，新帧从 (old_h-offset)/2 行起写入
+        其后（重叠区以旧画布为准，只补新增行）；负锚点（滚出长图顶部）
+        整帧前插。投影用同一公式同步增长。
         """
         img = pipe
         if self.canvas is None:
@@ -223,21 +227,21 @@ class PixPinLongShot:
             self.block = int(img.shape[0])
             return self.canvas
 
-        h = int(img.shape[0])
-        cur_len = int(self.canvas.shape[0])
-        if offset < 0:                                   # 上滚：前插
-            add = min(-offset, h)
-            if add > 0:
-                self.canvas = np.concatenate([img[:add], self.canvas], axis=0)
-        else:                                            # 下滚：追加
-            start = max(0, cur_len - offset)             # 已有内容起点
-            if start < h:
-                self.canvas = np.concatenate(
-                    [self.canvas, img[start:]], axis=0)
-
-        # 参考投影随长图一起长（PixPin 同样把当前帧投影并进 m_ref）
-        self.m_prof = row_profile(self.canvas)
-        self.block = h
+        old_h = int(self.canvas.shape[0])
+        f_h = int(img.shape[0])
+        prof = row_profile(img)
+        if offset < 0:
+            u = -offset
+            self.canvas = np.concatenate([img[:u], self.canvas], axis=0)
+            self.m_prof = np.concatenate([prof[:u], self.m_prof], axis=0)
+        else:
+            cut = (old_h + offset) // 2        # 旧画布保留段终点
+            src_start = (old_h - offset) // 2  # 新帧写入起点
+            self.canvas = np.concatenate(
+                [self.canvas[:cut], img[src_start:]], axis=0)
+            self.m_prof = np.concatenate(
+                [self.m_prof[:cut], prof[src_start:]], axis=0)
+        self.block = f_h
         return self.canvas
 
     def result(self) -> np.ndarray:
@@ -246,57 +250,12 @@ class PixPinLongShot:
             return None
         return self._from_pipeline(self.canvas)
 
-    # -------------------------------------------------- 固定带（屏幕固定件）
-    FIXED_MIN_ROWS = 24      # 连续不变的行数达到它才算固定带
-
-    def _detect_fixed(self, prev_pipe, cur_pipe):
-        """连续帧中几乎不变的连续行带（屏幕固定件：吸顶栏/固定右侧栏）。
-
-        横向滚动时网页的固定右侧栏在每帧的相同屏幕位置，逐帧整帧拼接会让
-        它在长图里反复出现（用户实测「黑色区域一直变宽」）。检测出来后在
-        管线态里把它挖掉，拼接与预览就只剩内容区。"""
-        if prev_pipe is None or prev_pipe.shape != cur_pipe.shape:
-            return None
-        d = np.abs(cur_pipe.astype(np.int16)
-                   - prev_pipe.astype(np.int16)).mean(axis=(1, 2))
-        quiet = d < 2.0
-        best, bs, s = 0, None, None
-        for i, q in enumerate(quiet):
-            if q and s is None:
-                s = i
-            elif not q and s is not None:
-                if i - s > best:
-                    best, bs = i - s, s
-                s = None
-        if s is not None and len(quiet) - s > best:
-            best, bs = len(quiet) - s, s
-        # 全帧都不变（静止帧 prev==cur）时 best 会等于整帧：那不是固定件，
-        # 而是没有新内容——返回 None，避免把帧裁成空。
-        if best >= self.FIXED_MIN_ROWS and best < int(quiet.size) - self.FIXED_MIN_ROWS:
-            return (bs, bs + best)
-        return None
-
-    def _strip_rows(self, img: np.ndarray, band):
-        """从管线态图（拼接轴 = axis0）中挖掉固定带行 [a:b)。"""
-        a, b = band
-        return np.ascontiguousarray(np.concatenate([img[:a], img[b:]], axis=0))
-
     def feed(self, frame_rgb: np.ndarray):
-        """PixPin 的 doMatch 全流程（`0x1400C7470`）：管线 → 裁固定带 →
-        find_offset → compose。返回 (status, offset, conf)。
+        """PixPin 的 doMatch 全流程（`0x1400C7470`）：管线 → find_offset →
+        status 0 才 compose。返回 (status, offset, conf)。
 
-        status 0 时长图已更新；首帧走 update_reference_pipe 登记参考。"""
+        首帧（画布为空）走 update_reference_pipe 登记参考。"""
         pipe = self._to_pipeline(frame_rgb)
-        if self._fixed is None and self.has_ref and self._prev_pipe is not None \
-                and self._prev_pipe.shape == pipe.shape:
-            band = self._detect_fixed(self._prev_pipe, pipe)
-            if band:
-                self._fixed = band
-                # 一次性从画布与参考投影中挖掉固定带行（后续帧同样裁）
-                self.canvas = self._strip_rows(self.canvas, band)
-                self.m_prof = self._strip_rows(self.m_prof, band)
-        pipe = self._strip_rows(pipe, self._fixed) if self._fixed else pipe
-        self._prev_pipe = pipe
         if not self.has_ref:
             self.update_reference_pipe(pipe)
             return ERR_OK, 0, 1.0
