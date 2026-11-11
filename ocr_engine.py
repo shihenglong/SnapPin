@@ -58,7 +58,10 @@ class _ModelBank:
             if name not in self._sess:
                 path = os.path.join(self.root, name)
                 so = ort.SessionOptions()
-                so.intra_op_num_threads = 2
+                # 用满物理核心：24 行长行的 rec 是纯 CPU 计算，限 2 线程会让
+                # 单次 OCR 拖到 7 秒（实测 0=自动≈物理核数 明显更快）
+                so.intra_op_num_threads = 0
+                so.inter_op_num_threads = 1
                 so.log_severity_level = 3
                 self._sess[name] = ort.InferenceSession(
                     path, sess_options=so, providers=["CPUExecutionProvider"])
@@ -130,9 +133,9 @@ def _crop_poly(img: np.ndarray, pts: np.ndarray) -> np.ndarray:
                                borderMode=cv2.BORDER_REPLICATE)
 
 
-_REC_MAX_W = 960         # 长行宽度上限：高 48 时 960 对应宽高比 20，
-                         # 覆盖绝大多数文本行。放到 2048 会让 rec 计算量翻倍
-                         # 而精度不变（实测 10 行识别结果相同，耗时减半）
+_REC_MAX_W = 0           # 0 = 不截断宽度，对齐 PixPin（目标宽 = 高 × 宽高比，
+                         # 报告 5.1 的 `(h/w × 48)` 逆运算，无上限）。
+                         # 非 0 时作为安全上限，防超宽行把内存/耗时撑爆。
 
 
 def _rec_prepare(crop: np.ndarray, img_h: int = 48, img_w: int = None):
@@ -143,7 +146,9 @@ def _rec_prepare(crop: np.ndarray, img_h: int = 48, img_w: int = None):
     这里按 48×宽高比算目标宽，上限 2048，批次内再统一补零。"""
     h, w = crop.shape[:2]
     tw_need = int(np.ceil(img_h * w / float(max(h, 1))))
-    tw_need = max(img_h, min(tw_need, _REC_MAX_W))
+    tw_need = max(img_h, tw_need)
+    if _REC_MAX_W > 0:
+        tw_need = min(tw_need, _REC_MAX_W)
     th = img_h
     canvas_w = int(img_w) if img_w else tw_need
     canvas_w = max(canvas_w, tw_need)
@@ -189,6 +194,11 @@ class OcrPipeline:
                              #  分支语义未确证，默认 0 = 不过滤，避免误伤单字）
     SR_MIN_H = 24            # 裁块高度小于它就当「小字」，先放大
     SR_MAX_FACTOR = 4
+    REC_BATCH = 1            # 逐框单张推理——对齐 PixPin（报告 5.2：「批量：
+                             # 一次只跑一个裁块，无 batch 维」）。实测这也更快：
+                             # batch=1 不必把整批 pad 到最宽者（24 行长行用例
+                             # batch=4 2612ms / 8 3089ms / 24 4102ms）
+    REC_BUCKET_RATIO = 1.5   # 仅 REC_BATCH>1 时生效（同桶内容许的最大宽度差）
 
     def __init__(self, models_dir: str, det: str, rec: str, keys: str,
                  cls: str = "ch_ppocr_mobile_v2.0_cls_infer.onnx"):
@@ -264,27 +274,6 @@ class OcrPipeline:
                         score))
         return out
 
-    # -- 方向 ------------------------------------------------------
-    def _orientation(self, crop: np.ndarray) -> int:
-        """0=正，1=转 180°（分类器不可用时一律按正处理）。"""
-        try:
-            sess = self.bank.session(self.cls_name)
-        except Exception:
-            return 0
-        try:
-            h, w = crop.shape[:2]
-            ratio = 192 / 48.0
-            tw = max(1, min(192, int(round(48 * w / float(max(h, 1))))))
-            im = cv2.resize(crop, (tw, 48), interpolation=cv2.INTER_LINEAR)
-            canvas = np.zeros((48, 192, 3), np.float32)
-            canvas[:, :tw] = im.astype(np.float32)
-            x = canvas.transpose(2, 0, 1)[None] / 255.0
-            x = (x - 0.5) / 0.5
-            out = sess.run(None, {sess.get_inputs()[0].name: x})[0]
-            return int(out[0].argmax())
-        except Exception:
-            return 0
-
     # -- 超分（PixPin sr 阶段的等价物）----------------------------
     def _upscale(self, crop: np.ndarray) -> np.ndarray:
         """小字块先放大再识别。没有 SR 模型时用 LANCZOS 近似放大；
@@ -313,12 +302,13 @@ class OcrPipeline:
         order = sorted(range(len(prepped)),
                        key=lambda i: prepped[i].shape[2])
         results = [None] * len(prepped)
-        batch = 8
+        batch = self.REC_BATCH
+        ratio = self.REC_BUCKET_RATIO
         groups, cur = [], []
         for i in order:
             w = prepped[i].shape[2]
             if cur and (len(cur) >= batch or
-                        w > prepped[cur[0]].shape[2] * 1.5):
+                        w > prepped[cur[0]].shape[2] * ratio):
                 groups.append(cur)
                 cur = []
             cur.append(i)
@@ -365,9 +355,12 @@ class OcrPipeline:
             crops = []
             for pts, sc in boxes:
                 crop = _crop_poly(sub, pts)
-                if self._orientation(crop) == 1:
-                    crop = cv2.rotate(crop, cv2.ROTATE_180)
-                crop = self._upscale(crop)
+                # 不做 180° 方向分类：PixPin 的 ncnn 主链路只有 det + rec 两个
+                # 模型（报告 2.5），没有 cls。而 cls 对长行会误判——930px 宽的
+                # 行走进来被压到 192px，模型判成倒置 → 整行旋转 180° → 识别出
+                # 'adsun ue tl vie ym' 这种倒置乱码，正是「某些行识别不到」的根因。
+                # 也不做小字放大：_rec_prepare 统一缩到高 48 就已经放大了，
+                # 先放大再缩回是双重插值（更慢且糊）。
                 crops.append((crop, pts, sc))
             for text, sc, pts in self._recognize(crops):
                 if not text.strip():
