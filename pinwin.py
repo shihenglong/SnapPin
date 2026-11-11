@@ -340,16 +340,13 @@ class PinWindow(QWidget):
         self._press_mode = None
 
     def _after_select(self):
-        """选字结束（文字图层回调）：提示选中字数。"""
-        n = self._text_layer.selection_count()
-        if n:
-            self._toast_text(f"已选中 {n} 字 · Ctrl+C 复制", 1800)
+        """选字结束（文字图层回调）：不再弹选中字数提示。"""
+        return
 
     def mouseDoubleClickEvent(self, e):
         # 双击 = 复制贴图 → 自动进入剪贴板历史；不关闭（防误触）。
         # 关闭只走双击 Esc / 右键菜单 / Alt+2
         QApplication.clipboard().setPixmap(self._current_pix())
-        self._toast_text("已复制贴图 · 已进剪贴板历史 · 双击 Esc 关闭", 2200)
         e.accept()
 
     def keyPressEvent(self, e):
@@ -389,7 +386,6 @@ class PinWindow(QWidget):
         if text.strip():
             n = self._text_layer.selection_count()
             QApplication.clipboard().setText(text)
-            self._toast_text(f"已复制 {n} 字：{text[:40]}")
 
     # ------------------------------------------------ OCR
     def _auto_ocr(self, retry=0):
@@ -401,7 +397,6 @@ class PinWindow(QWidget):
             return
         self._ocr.done.connect(self._auto_ocr_done, Qt.UniqueConnection)
         self._ocr.failed.connect(self._auto_ocr_failed, Qt.UniqueConnection)
-        self._toast_text("正在取字…", 4000)
         self._ocr.run(self._pix)
 
     def _unhook(self, done_slot, failed_slot):
@@ -418,8 +413,6 @@ class PinWindow(QWidget):
                                d["box"][3][1] - d["box"][0][1]) for d in items],
                         [d["text"] for d in items],
                         [d["box"] for d in items])
-        if items:
-            self._toast_text(f"识别到 {len(items)} 段 · 文字上拖拽选字 · Ctrl+C 复制 · Esc 关闭", 2600)
 
     def _auto_ocr_failed(self, msg):
         self._unhook(self._auto_ocr_done, self._auto_ocr_failed)
@@ -445,7 +438,6 @@ class PinWindow(QWidget):
                         [d["text"] for d in items],
                         [[[p[0] + ox, p[1] + oy] for p in d["box"]]
                          for d in items])
-        self._toast_text(f"已更新 {len(items)} 段文字")
 
     def _set_boxes(self, rects, texts, quads=None):
         """把识别结果同时喂给两处：
