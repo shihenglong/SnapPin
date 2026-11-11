@@ -38,6 +38,108 @@ _LOCAL_EXE = os.path.join(_TR_PLUGIN, "engine", "translate-engine.exe")
 _LOCAL_LANG = {"zh": "zh", "zh-cn": "zh", "zh-tw": "zh", "en": "en",
                "ja": "ja", "ko": "ko"}
 
+# ---- 技术代码 token 保护 ----------------------------------------------
+# 离线引擎对 CSS 属性对/标签/路径这类 ASCII 代码词会逐词错译
+# （white-space→「白- 空格」、overflow-x→「express- x」，用户实测）。
+# 翻译前抽成字母数字占位 zz0zz（引擎实测 100% 原样保留），译后还原。
+_CODE_TOKEN = re.compile(
+    r"https?://\S+?"                                        # URL
+    r"|<!?/?[A-Za-z][^<>{}]{0,60}?>"                        # HTML/XML 标签
+    r"|#[0-9a-fA-F]{3,8}\b"                                 # 十六进制色
+    r"|[A-Za-z][A-Za-z0-9_-]*\s*:\s*[A-Za-z0-9][A-Za-z0-9.-]*"  # CSS 属性对（值限单 token）
+    r"|\b[A-Za-z]+(?:[-_][A-Za-z0-9]+)+\b"                  # 连字符/下划线词
+    r"|\b[\w.-]+\.(?:html|htm|css|js|json|py|png|jpe?g|gif|md|txt|yaml|yml|ini|bat|sh)\b"
+)
+_PLACEHOLDER = re.compile(r"zz(\d{1,3})zz")
+
+# 英文句子结构判别：常见停用词（前后加空格做整词匹配）
+_EN_STOP = (" the ", " and ", " of ", " to ", " a ", " in ", " is ", " are ",
+            " for ", " with ", " on ", " when ", " that ", " this ", " how ",
+            " can ", " be ", " it ")
+
+
+def _protect_codes(texts):
+    """texts → (受保护文本列表, 每条的 token 表)。"""
+    out = []
+    for t in texts:
+        toks: list[str] = []
+
+        def _sub(m):
+            toks.append(m.group(0))
+            return f"zz{len(toks) - 1:02d}zz"
+
+        out.append((_CODE_TOKEN.sub(_sub, t), toks))
+    return out
+
+
+_CSS_COMMENT = re.compile(r"/\*\s*([A-Za-z][^*/]{2,160}?)\s*\*/")
+
+
+def _extract_comments(prot):
+    """把 /* 英文注释 */ 抽成占位：注释是自然语言（代码块里唯一该翻的
+    部分），注释文本记为待翻行并追加到 token 表尾部（占位 zzJJzz 走统一
+    还原）；未翻/失败时 token 保持英文原文，注释原样保留、代码主体不受
+    引擎乱码影响。返回 [(行下标, tok 下标, 注释文本)]。"""
+    jobs = []
+    for i, (t, toks) in enumerate(prot):
+        def _csub(m):
+            inner = m.group(1).strip()
+            j = len(toks)
+            toks.append(inner)
+            jobs.append((i, j, inner))
+            return f"/* zz{j:02d}zz */"
+
+        t2 = _CSS_COMMENT.sub(_csub, t)
+        prot[i] = (t2, toks)
+    return jobs
+
+
+def _needs_mt_cmt(inner: str) -> bool:
+    """注释是自然语言的强标志：不做停用词检查，只要求拉丁主导。"""
+    letters = [ch for ch in inner if ch.isalpha()]
+    if not letters:
+        return False
+    cjk = sum(1 for ch in letters
+              if "\u2e80" <= ch <= "\u9fff" or "\u3400" <= ch <= "\u4dbf")
+    return cjk * 2 < len(letters)
+
+
+def _restore_codes(line: str, toks: list[str]) -> str:
+    """占位还原；下标越界（引擎吞/改占位）时保守保留原样。"""
+
+    def _sub(m):
+        i = int(m.group(1))
+        return toks[i] if i < len(toks) else m.group(0)
+
+    return _PLACEHOLDER.sub(_sub, line)
+
+
+def _needs_mt(line: str, n_toks: int = 0) -> bool:
+    """行级语言分流：en→zh 模型把中文输入整句编成 unk（输出
+    「2025/1997/29*, ⁇ ⁇ ⁇」式乱码，用户实测截图）。
+
+    送翻需同时满足：
+    - 拉丁字母占主导（CJK 不足一半）——中文行原样保留
+    - 非「代码块」：抽出的 token ≥ 2 且全行无中文时是 CSS/代码段，不翻
+      （技术代码原样保留才是正确行为）
+    - 有英文句子结构：常见停用词（the/and/of/…）出现，区分英文句子与
+      无语义的标识符串"""
+    if not line.strip():
+        return False
+    letters = [ch for ch in line if ch.isalpha()]
+    if not letters:
+        return False                       # 纯数字/符号：无需翻译
+    cjk = sum(1 for ch in letters
+              if "\u2e80" <= ch <= "\u9fff" or "\u3400" <= ch <= "\u4dbf")
+    if cjk * 2 >= len(letters):
+        return False                       # 中文主导：原样保留
+    if n_toks >= 2 and cjk == 0:
+        return False                       # 多 token 零中文：代码块
+    low = " " + line.lower() + " "
+    stop = sum(low.count(w) for w in _EN_STOP)
+    return stop >= 2 or (stop >= 1 and n_toks <= 1)
+
+
 _OLLAMA_HOST = "http://localhost:11434"
 _OLLAMA_PREFS = ("qwen", "deepseek", "glm")   # 模型自动检测优先级
 _TIMEOUT_MS = 20_000
@@ -433,15 +535,31 @@ class TranslateClient(QObject):
 
     # ------------------------------------------------ 离线插件（Bergamot，QProcess 文件 IPC）
     def _local_translate(self, texts: list, target: str, tag: int, merge=None):
-        """merge=(base_results, indices)：只把结果写回指定下标后整体发出。"""
+        """merge=(base_results, indices)：只把结果写回指定下标后整体发出。
+
+        行级分流：中文为主的行不送 en→zh 模型（整句 unk 乱码），原样保留，
+        英文代码词已由占位保护原样呈现——正合「中文页面里翻掉英文残留」
+        的预期；拉丁字母主导的行才真正送翻。"""
         to = _LOCAL_LANG.get((target or "zh-CN").lower(), "zh")
+        prot = _protect_codes(texts)
+        cmt = _extract_comments(prot)                  # [(行下标, tok 下标, 注释)]
+        cmt_pending = [(li, j, inner) for li, j, inner in cmt
+                       if _needs_mt_cmt(inner)]
+        cmt_send = [inner for _li, _j, inner in cmt_pending]
+        send = [i for i, (t, toks) in enumerate(prot) if _needs_mt(t, len(toks))]
+        if not send and not cmt_send:
+            self.last_engine = "离线（无可翻译文本，代码原样保留）"
+            self.done.emit(list(texts), tag)
+            return
         fd_in, path_in = tempfile.mkstemp(suffix=".txt", prefix="snappin_tr_")
         fd_out, path_out = tempfile.mkstemp(suffix=".txt", prefix="snappin_tr_")
         os.close(fd_in)
         os.close(fd_out)
         try:
             with open(path_in, "w", encoding="utf-8") as f:
-                f.write("\n".join(t.replace("\n", " ") for t in texts))
+                f.write("\n".join(
+                    ([prot[i][0].replace("\n", " ") for i in send]
+                     + cmt_send)))
         except OSError:
             self.failed.emit("离线插件输入文件写入失败", tag)
             return
@@ -472,9 +590,25 @@ class TranslateClient(QObject):
                 self.failed.emit("离线翻译插件执行失败", t)
                 return
             lines = out.splitlines()
-            lines = [ln.strip() for ln in lines][:n]
-            while len(lines) < n:                     # 引擎少数行 → 原文兜底
-                lines.append(texts[len(lines)])
+            lines = [ln.strip() for ln in lines]
+            n_main = len(send)
+            sent_set = set(send)
+            full = list(texts)
+            for k, i in enumerate(send):
+                if k < n_main and lines[k]:
+                    full[i] = _restore_codes(lines[k], prot[i][1])
+            # 注释译文回填 token 表（缺行/失败保持英文原文，注释原样保留）
+            cmt_out = lines[n_main:n_main + len(cmt_pending)]
+            for (li, j, _inner), zh in zip(cmt_pending, cmt_out):
+                if zh.strip():
+                    prot[li][1][j] = zh
+            # 统一占位还原（含 /* zz..zz */ → /* 中文译文 */）。
+            # 未送翻行必须以「受保护文本」为底：它的占位（含注释占位）只有
+            # 在还原时才会变成中文译文/原 token。
+            for i, (pt, toks) in enumerate(prot):
+                if i not in sent_set:
+                    full[i] = _restore_codes(pt, toks)
+            lines = full
             if m is not None:                         # 在线直连的缺口补齐模式
                 base, indices = m
                 for j, idx in enumerate(indices):
@@ -483,7 +617,7 @@ class TranslateClient(QObject):
                 self.last_engine = "在线直连+词典兜底"
                 self.done.emit(base, t)
             else:
-                self.last_engine = "离线词典兜底"
+                self.last_engine = "离线（Bergamot）"
                 self.done.emit(lines, t)
 
         proc.finished.connect(_fin)

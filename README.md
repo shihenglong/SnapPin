@@ -1,7 +1,8 @@
 # SnapPin — PixPin 风格截图贴图工具（开源复刻）
 
 Python + PySide6 实现的 PixPin 核心功能复刻：**截图 / 贴图 / OCR 取字 / 翻译 / 长截图 / GIF 录制 / Ditto 式剪贴板历史 / 密码管理**。
-纯从零实现，未使用任何 PixPin 反编译产物；OCR 用 RapidAI 的开源 RapidOCR-json（PaddleOCR ONNX 模型），
+纯从零实现，未使用任何 PixPin 反编译产物；OCR 走 **PixPin 式三段管线**（检测 → 裁块 → 超分 → 识别，
+PaddleOCR ONNX 模型 + onnxruntime 进程内推理，缺依赖时自动回退 RapidOCR-json），
 翻译支持免 Key 在线直连 / GLM / MiniMax / 自定义 OpenAI 兼容 API / 本地离线引擎。
 
 ## 下载（Windows）
@@ -36,10 +37,98 @@ Python + PySide6 实现的 PixPin 核心功能复刻：**截图 / 贴图 / OCR �
 - **自动滚动**：预览窗点「自动滚动」，程序每 400ms 检查一次、**拼好一段才滚下一段**；
   连续四拍没有新内容即判定到底并停止。
 - **背景解锁**：进入长截图后覆盖层只保留选区边框与工具栏，选区外恢复实时桌面，滚动时四周无割裂感。
-- **拖影防护**：只合并「连续两帧逐像素一致」的静止帧；锚定条带必须逐像素精确命中，
-  重叠区一致率需 ≥97%，否则整帧丢弃（预览窗状态栏显示「拒绝 N 帧」，页面在变时一目了然）。
-- **悬浮件消除**：吸顶栏 / 「回到底部」等固定按钮自动识别并消除，不沿长图重复盖章，也不误伤正文。
+- **位移匹配（PixPin 原样复刻）**：每帧先出「匹配结果」再驱动拼接——灰度化 → 横向压到 **32 px**
+  （`INTER_AREA`）→ 纵向 `boxFilter` **1×15** 平滑，用**汉明距离**做逐行最近邻，再对
+  `Δ = trainIdx − queryIdx` **投票**取冠军；单候选误差阈值 `≤ max(30, 2×最小距离)`，
+  置信度 `(top−runner2nd)/(top+2nd)` 必须 **≥ 0.5**，否则判「没匹配上」。
+  搜索范围限定在 `[上次位移−block, 上次位移+2×block]`（滚动速度连续）。
+- **对不上就跳过**：`status 2`（未匹配）整帧丢弃、`status 1`（到底）停手——PixPin 没有任何
+  「硬衔接」或兜底拼接；预览窗状态栏显示「拒绝 N 帧」。
 - **保存与贴图**：工具栏「保存」弹另存为对话框；「贴图」把长图直接钉到桌面（自动缩放适配屏幕）。
+
+### 与 PixPin 实测实现的对齐表
+
+逆向 `QLongScreenShot`(`0x1400C7370`)、匹配器 `findOffset`(`0x1400CE530`)、
+`compose`(`0x1400CDFB0`/`0x1400CDA00`)，按地址级证据逐条复刻（引擎在 `longshot_pixpin.py`）：
+
+| 维度 | PixPin（实测） | 本项目 | 对齐 |
+|---|---|---|---|
+| 行投影 | 灰度 → 宽 **32** `INTER_AREA` → `boxFilter` **1×15** | 同 | ✅ 完全一致 |
+| 匹配器 | `cv::BFMatcher(NORM_HAMMING)`，`knnMatch(k=1)` | `np.bitwise_count` 逐行汉明距离，取 argmin | ✅ 等价 |
+| 单候选阈值 | `distance ≤ max(30.0, 2×全体最小距离)` | 同 | ✅ 一致 |
+| 投票 | `unordered_map<int,int>`，Δ = trainIdx − queryIdx | `np.unique` 计数 | ✅ 等价 |
+| 接受判据 | 唯一候选→1.0；否则 `(top−2nd)/(top+2nd) ≥ 0.5` | 同 | ✅ 一致 |
+| 搜索窗口 | `[上次位移−block, 上次位移+2×block)` | 同（首帧退化全量程，见注） | ✅ 一致 |
+| 绝对位移 | 窗口起点 + Δ，负值截 0，写回作下帧锚点 | 同 | ✅ 一致 |
+| 失败码 | 1 = 到底 / 2 = 未匹配 | `ERR_BOTTOM` / `ERR_NO_MATCH` | ✅ 一致 |
+| 横向 | `cv::rotate` 90° 顺时针 → 复用纵向 → 逆时针转回 | `np.rot90(k=-1)` / `k=1` | ✅ 一致 |
+| 抓帧周期 | `QTimer::start(timer, 100)` | `FRAME_INTERVAL_MS = 100` | ✅ 一致 |
+| 拼接 | 逐行 `memcpy` 到 `r+offset` 行；每帧新建 QImage 全拷贝 | 同语义（按 offset 对齐、重叠被覆盖、无显式去重），只写新增段 | ⚠️ 语义一致、省掉 O(n²) 拷贝 |
+| 固定件 | 无专门处理（投票淹没 Δ=0 的票） | 同 | ✅ 一致 |
+| 滚动驱动 | **只监听**真实滚轮（`WH_MOUSE_LL` 只画箭头），**不注入** | 另加可选**主动注入**自动滚动（`mouse_event`） | ⬆️ 本项目的额外能力 |
+
+**未照搬的两处**（都有明确理由）：
+
+1. `m_ref.rows < 3×block` 时 PixPin 会 `goto LAB_1400ce69a`（该分支语义未确证），照抄会导致
+   **第二帧永远无法匹配**；这里退化为全量程搜索。
+2. 拼接起点 PixPin 是 `(dst.rows−offset)/2`，但报告已注明 `offset` 的绝对/相对语义未核实
+   （且尺寸不自洽会 `exit(-1)`）。这里按语义实现（按绝对位移对齐写入）。
+
+**继承自 PixPin 的已知限制**：窗口内搜索意味着「一步跳出窗口」（拖滚动条跳很远）那一拍
+匹配不上，只能等滚回窗口内；且跳滚后的第一拍可能落在错误位置（窗口外内容它看不到）。
+这是 PixPin 的固有限制，不是实现偏差。
+
+注：`cv::matchTemplate` 的符号确实在 PixPin 静态链接的 OpenCV 里，但长截图链路**没有调用它**
+（字符串表与 RTTI 中不存在该函数名），实际是「逐行签名 + 汉明距离 + 位移投票」。
+
+## OCR（PixPin 式三段管线）
+
+逆向 PixPin 的 `OcrRunnable` / `OcrTextItemLayer` 后按同样的结构实现
+（`ocr_engine.py`；原 RapidOCR-json 黑盒路径保留为回退，缺依赖时自动生效）：
+
+| 阶段 | 本项目实现 | 与 PixPin 的一致处 |
+|---|---|---|
+| 检测 | `ch_PP-OCRv4_det` ONNX，长边限幅 + 两边对齐 32 | 二值化阈值 0.3；**ImageNet 均值方差归一化**（实测常量 mean{0.485,0.456,0.406}、norm{1/58.395,1/57.12,1/57.375}，即 `(x-mean)/std`） |
+| 超分 | 小字块（高 <24px）放大后再识别 | PixPin 编译进了 sr 超分网（224→448），但在两条 OCR 链路上都没找到 forward 调用；这一阶段是本项目的补强 |
+| 识别 | `rec_ch_PP-OCRv4` ONNX，高 48、宽按宽高比自适应 | CTC 贪心解码：argmax → 跳 blank(0) → 去重复 → `cls-1` 查字典 → 置信度取各步最大概率均值 |
+| 结果 | 四角坐标 + 文本 + 置信度 | 同构（PixPin 是 0x30 字节/条的数组） |
+| 交互 | 可选中文字框，选字用**字符索引区间** | 同构（PixPin 也是字符区间 + 四边形上二分定位，无逐字符 bbox） |
+| 线程 | QThread + 跨线程信号 | PixPin 用 QThreadPool + QRunnable，同为异步 |
+
+两处**有意的性能改进**（PixPin 的实现特征，而非照搬）：模型 session 进程内缓存
+（PixPin 每次 OCR 都从资源重新加载两套 ncnn 模型）、识别按宽度分桶批推理
+（PixPin 逐框单张）。
+
+参数校准依据（合成图 10 行 × 混合字号，字符相似度）：
+
+| 检测归一化 | 平均相似度 |
+|---|---|
+| `(x/255-0.5)/0.5`（改造前） | 0.971 |
+| ImageNet 均值方差（**采用**） | **0.987** |
+
+### 文字图层（PixPin `OcrTextItemLayer` 复刻）
+
+`ocrtext_layer.py` 按逆向结果复刻 PixPin 的文字图层，不是自绘近似：
+
+| PixPin | 地址 | 本模块 |
+|---|---|---|
+| `OcrGraphicsTextItem` 构造 | `0x14005e160` | `OcrGraphicsTextItem.__init__` |
+| 选字交互（模式码 1..7） | `0x14005f0f0` | `OcrTextItemLayer.hit_test()` |
+| 设置字符区间 `(selStart, selEnd)` | `0x14005f8a0` | `set_selection()` |
+| 四边形上**二分**定位字符 | `0x14005f210` | `char_at()` |
+| 文本回收（遍历 childItems + 动态转换） | `0x140060100` | `selection_ranges()` |
+
+与旧实现的关键差别（也正是这次"抄"的重点）：
+
+- 每个识别块是 **QGraphicsItem**，自带四角坐标 + 文本 + 置信度（PixPin 的 `+0x48`/`+0x68`/`+0x70`）；
+- 选中态是**字符索引区间**，不是逐字符矩形集合；
+- 字符位置由**四边形插值**算出（斜排文本同样准确），不是"均分宽度"；
+- 命中字符用**二分**，不是线性扫描；
+- 高亮色沿用 PixPin 实测值 `QColor(0x33,0x99,0xff,0x7f)`。
+
+翻译链完全没动：`_set_boxes()` 同时喂 `_ocr_boxes`（给翻译用的 `_blocks`/`_build_replaced`）
+与文字图层（给选字用的四角坐标），所以「右键 → 翻译（替换原图）」照旧，
+选字高亮也从"另画一遍"变成图层自己绘制。
 
 ## GIF 录制
 
@@ -55,7 +144,8 @@ Python + PySide6 实现的 PixPin 核心功能复刻：**截图 / 贴图 / OCR �
 ## 从源码运行
 
 ```bash
-pip install PySide6 numpy pillow      # pillow 用于 GIF 编码
+pip install PySide6 numpy pillow onnxruntime opencv-python-headless
+# pillow：GIF 编码；onnxruntime + opencv：OCR 三段管线（缺失时自动回退 RapidOCR-json）
 python main.py        # 常驻托盘；开机自启可在设置里开
 ```
 
@@ -161,7 +251,8 @@ SnapPin/
 ├── updater.py        # 检查更新（GitHub Releases API）
 ├── capture.py        # 截图覆盖层 + 工具栏 + 标注 + 长截图 + GIF 录制
 ├── pinwin.py         # 贴图窗口（取字/翻译替换）
-├── ocr.py            # RapidOCR-json QProcess 封装
+├── ocr.py            # OCR 调度：进程内三段管线优先，RapidOCR-json 回退
+├── ocr_engine.py     # PixPin 式 OCR 管线：检测→裁块→超分→识别（onnxruntime + opencv）
 ├── translate.py      # 翻译：免 Key 直连/GLM/MiniMax/自定义 API + 本地离线引擎（批量）
 ├── hotkeys.py        # RegisterHotKey 全局热键线程
 ├── settings_ui.py    # 设置窗口（导航 + 卡片 + 确定应用取消 + 检查更新）

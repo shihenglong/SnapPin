@@ -1,13 +1,16 @@
 """贴图窗口 v3 — 贴图即取字（拖拽选字/点击复制）+ 分块并发翻译 + 译文按块替换。"""
 import time
 
-from PySide6.QtCore import QPoint, QRect, QSize, Qt, QTimer
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QSize, Qt, QTimer
 from PySide6.QtGui import (QBrush, QColor, QFont, QFontDatabase, QIcon, QImage,
-                           QPainter, QPen, QPixmap, QTextLayout, QTextOption)
-from PySide6.QtWidgets import (QApplication, QLabel, QMenu, QWidget,
-                               QGraphicsDropShadowEffect)
+                           QMouseEvent, QPainter, QPen, QPixmap, QTextLayout,
+                           QTextOption)
+from PySide6.QtWidgets import (QApplication, QFrame, QGraphicsDropShadowEffect,
+                               QGraphicsScene, QGraphicsView, QLabel, QMenu,
+                               QWidget)
 
 from icons import icon, APP_ICON_SVG
+from ocrtext_layer import OcrTextItemLayer
 
 MARGIN = 14
 ACCENT_PIN = "#2E7CF6"
@@ -68,6 +71,84 @@ class BoxLayer(QWidget):
         self._win.paint_boxes(self)
 
 
+class _TextLayerView(QGraphicsView):
+    """PixPin 文字图层的显示与交互宿主。
+
+    透明无边框叠在图片上：命中文字 → 交给图层做「字符区间」选字；
+    未命中 → 把事件翻译回窗口坐标再转发给 PinWindow，保持「空白拖拽移动
+    贴图」的原手感（QGraphicsView 默认会吞掉所有鼠标事件）。
+    """
+
+    def __init__(self, win, scene):
+        super().__init__(scene, win)
+        self._win = win
+        self.setStyleSheet("background:transparent;border:none;")
+        self.setFrameShape(QFrame.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.viewport().setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.IBeamCursor)
+
+    def _scene_pos(self, e) -> QPointF:
+        return self.mapToScene(e.position().toPoint())
+
+    def _forward(self, e, handler):
+        gp = e.globalPosition().toPoint()
+        ev = QMouseEvent(e.type(), QPointF(self._win.mapFromGlobal(gp)),
+                         e.globalPosition(), e.button(), e.buttons(),
+                         e.modifiers())
+        handler(ev)
+
+    def mousePressEvent(self, e):
+        layer = self._win._text_layer
+        pos = self._scene_pos(e)
+        if e.button() == Qt.LeftButton and layer.hit_test(pos) is not None:
+            layer.begin_selection(pos)
+            self._win._selecting = True
+            e.accept()
+            return
+        e.ignore()
+        self._forward(e, self._win.mousePressEvent)
+
+    def mouseMoveEvent(self, e):
+        layer = self._win._text_layer
+        if self._win._selecting:
+            layer.drag_selection(self._scene_pos(e))
+            e.accept()
+            return
+        pos = self._scene_pos(e)
+        hit = layer.hit_test(pos) is not None
+        self.setCursor(Qt.IBeamCursor if hit else Qt.SizeAllCursor)
+        if not (e.buttons() & Qt.LeftButton):
+            # 悬停：只管光标，不转发——转给 PinWindow 会把它设成"移动"箭头，
+            # 用户就以为文字不可选（表现为「拖不了选字」）
+            e.accept()
+            return
+        e.ignore()
+        self._forward(e, self._win.mouseMoveEvent)
+
+    def mouseReleaseEvent(self, e):
+        if self._win._selecting:
+            self._win._text_layer.end_selection()
+            self._win._selecting = False
+            self._win._after_select()
+            e.accept()
+            return
+        e.ignore()
+        self._forward(e, self._win.mouseReleaseEvent)
+
+    def mouseDoubleClickEvent(self, e):
+        e.ignore()
+        self._forward(e, self._win.mouseDoubleClickEvent)
+
+    def wheelEvent(self, e):
+        e.ignore()
+        self._forward(e, self._win.wheelEvent)
+
+
 class PinWindow(QWidget):
     """一张贴图：自动 OCR；文字上拖拽=选中（高亮）；Ctrl+C/右键复制；空白拖拽=移动。"""
     instances = []
@@ -89,13 +170,10 @@ class PinWindow(QWidget):
         self._pix = pixmap
         self._scale = 1.0
         self._ocr_boxes = []          # [{'box': QRect(原始像素), 'text': str}]
-        self._selected = set()
+        self._selecting = False       # 正在拖拽选字（PixPin 文字图层接管）
         self._band_start = None
         self._band = QRect()
-        self._sel_rect = QRect()
-        self._hover_i = -1
-        self._press_mode = None       # 'select' / 'move'
-        self._press_pos = QPoint()
+        self._press_mode = None       # 'move'（选字已交给文字图层）
         self._press_global = QPoint()
         self._moved = False
         self._translated_pix = None
@@ -119,6 +197,14 @@ class PinWindow(QWidget):
 
         self._box_layer = BoxLayer(self)
         self._box_layer.raise_()
+
+        # PixPin 文字图层（OcrTextItemLayer / OcrGraphicsTextItem 复刻）：
+        # 每个识别块是一个 QGraphicsItem，选中态是字符区间
+        self._scene = QGraphicsScene(self)
+        self._text_layer = OcrTextItemLayer()
+        self._scene.addItem(self._text_layer)
+        self._view = _TextLayerView(self, self._scene)
+        self._view.raise_()
 
         self._toast = QLabel(self)
         self._toast.setStyleSheet(
@@ -162,6 +248,16 @@ class PinWindow(QWidget):
         self._label.setPixmap(self._current_pix())
         self._box_layer.setGeometry(MARGIN, MARGIN, size.width(), size.height())
         self._box_layer.raise_()
+        # 文字图层：scene 用图像原始像素坐标，缩放交给 view 的 transform，
+        # 这样 item 内部（字符插值、二分命中）完全不用管 zoom
+        pm = self._current_pix()
+        iw = max(1, pm.width())
+        ih = max(1, pm.height())
+        self._scene.setSceneRect(0, 0, iw, ih)
+        self._view.resetTransform()
+        self._view.scale(size.width() / iw, size.height() / ih)
+        self._view.setGeometry(MARGIN, MARGIN, size.width(), size.height())
+        self._view.raise_()
         self.resize(size.width() + 2 * MARGIN, size.height() + 2 * MARGIN)
         self.update()
 
@@ -202,7 +298,6 @@ class PinWindow(QWidget):
         if e.button() != Qt.LeftButton:
             return
         pos = self._ev_pos(e)
-        self._press_pos = pos
         self._press_global = e.globalPosition().toPoint()
         self._moved = False
         if e.modifiers() & Qt.ShiftModifier:
@@ -210,14 +305,11 @@ class PinWindow(QWidget):
             self._band = QRect()
             self._press_mode = None
             return
-        if self._box_at(pos) >= 0:
-            self._press_mode = "select"
-            self._sel_rect = QRect(pos, pos)
-            self._select_chars(self._sel_rect)
-        else:
-            self._press_mode = "move"
-            self.setCursor(Qt.SizeAllCursor)
-            self._drag_at = self._press_global - self.frameGeometry().topLeft()
+        # 选字已交给 PixPin 文字图层：_TextLayerView 命中文字时自行处理，
+        # 只有未命中才把事件转发到这里 → 这里只剩「移动贴图」
+        self._press_mode = "move"
+        self.setCursor(Qt.SizeAllCursor)
+        self._drag_at = self._press_global - self.frameGeometry().topLeft()
 
     def mouseMoveEvent(self, e):
         pos = self._ev_pos(e)
@@ -226,22 +318,13 @@ class PinWindow(QWidget):
                 self._band = QRect(self._band_start, pos).normalized()
                 self.update()
                 return
-            if self._press_mode == "select":
-                self._sel_rect = QRect(self._press_pos, pos).normalized()
-                self._select_chars(self._sel_rect)
-                self.update()
-                return
             if self._press_mode == "move":
                 gp = e.globalPosition().toPoint()
                 if (gp - self._press_global).manhattanLength() > 5:
                     self._moved = True
                 self.move(gp - self._drag_at)
                 return
-        if self._ocr_boxes:
-            i = self._box_at(pos)
-            self.setCursor(Qt.IBeamCursor if i >= 0 else Qt.SizeAllCursor)
-        else:
-            self.setCursor(Qt.SizeAllCursor)
+        self.setCursor(Qt.SizeAllCursor)
 
     def mouseReleaseEvent(self, e):
         if e.button() != Qt.LeftButton:
@@ -254,13 +337,13 @@ class PinWindow(QWidget):
                 self._ocr_region(band)
             self.update()
             return
-        if self._press_mode == "select":
-            if self._selected:
-                self._toast_text(f"已选中 {len(self._selected)} 段 · Ctrl+C 复制", 1800)
-            else:
-                self._selected = set()
-                self.update()
         self._press_mode = None
+
+    def _after_select(self):
+        """选字结束（文字图层回调）：提示选中字数。"""
+        n = self._text_layer.selection_count()
+        if n:
+            self._toast_text(f"已选中 {n} 字 · Ctrl+C 复制", 1800)
 
     def mouseDoubleClickEvent(self, e):
         # 双击 = 复制贴图 → 自动进入剪贴板历史；不关闭（防误触）。
@@ -271,9 +354,8 @@ class PinWindow(QWidget):
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key_Escape:
-            if self._selected:
-                self._selected = set()
-                self.update()
+            if self._text_layer.has_selection():
+                self._text_layer.clear_selection()
                 self._esc_t0 = 0.0        # 清选字不算第一次 Esc
                 return
             # 双击 Esc 才关闭：单击只提示，防误关
@@ -285,19 +367,12 @@ class PinWindow(QWidget):
             self._toast_text("再按一次 Esc 关闭贴图", 1500)
             return
         if e.key() == Qt.Key_C and e.modifiers() & Qt.ControlModifier:
-            if self._selected:
+            if self._text_layer.has_selection():
                 self._copy_selection()
             return
         super().keyPressEvent(e)
 
-    # ------------------------------------------------ 选字/复制
-    def _box_at(self, pos) -> int:
-        for i, it in enumerate(self._ocr_boxes):
-            r = self._to_widget_rect(it["box"])
-            if r.adjusted(-4, -4, 4, 4).contains(pos):
-                return i
-        return -1
-
+    # ------------------------------------------------ 选字/复制（文字图层接管）
     def _to_orig_rect(self, widget_rect: QRect) -> QRect:
         inner = widget_rect.adjusted(-MARGIN, -MARGIN, -MARGIN, -MARGIN)
         return QRect(int(inner.x() / self._scale), int(inner.y() / self._scale),
@@ -307,44 +382,14 @@ class PinWindow(QWidget):
         return QRect(MARGIN + int(orig.x() * self._scale), MARGIN + int(orig.y() * self._scale),
                      int(orig.width() * self._scale), int(orig.height() * self._scale))
 
-    def _char_widget_rect(self, bi: int, ci: int) -> QRect:
-        """第 bi 块第 ci 个字符的窗口坐标矩形（字符矩形按当前缩放换算）。"""
-        c = self._ocr_boxes[bi]["chars"][ci]
-        return QRect(MARGIN + int(c.x() * self._scale), MARGIN + int(c.y() * self._scale),
-                     max(2, int(c.width() * self._scale)), int(c.height() * self._scale))
-
-    def _select_chars(self, widget_rect: QRect):
-        """光标划过的字符（按字符矩形与拖拽范围相交）全部选中。"""
-        sel = set()
-        for bi, it in enumerate(self._ocr_boxes):
-            box_r = self._to_widget_rect(it["box"])
-            if not box_r.intersects(widget_rect):
-                continue
-            for ci, c in enumerate(it["chars"]):
-                cr = QRect(MARGIN + int(c.x() * self._scale),
-                           MARGIN + int(c.y() * self._scale),
-                           max(2, int(c.width() * self._scale)),
-                           int(c.height() * self._scale))
-                if cr.intersects(widget_rect):
-                    sel.add((bi, ci))
-        if sel != self._selected:
-            self._selected = sel
-            self.update()
-
-    def _copy_selection(self):
-        if not self._selected:
-            return
-        # 按块分组：块内按字符下标拼接，块间按序衔接（旧实现每字符重复拼整块文本）
-        blocks: dict[int, list[int]] = {}
-        for bi, ci in self._selected:
-            blocks.setdefault(bi, []).append(ci)
-        text = ""
-        for bi in sorted(blocks):
-            seg = "".join(self._ocr_boxes[bi]["text"][c] for c in sorted(blocks[bi]))
-            text = seg if not text else _join_text(text, seg)
+    def _copy_selection(self, _checked=False):
+        """复制选中文字：文本由文字图层按「字符区间」回收，块间用 `_join_text`
+        衔接（中日韩不加空格、西文加空格）。"""
+        text = self._text_layer.selection_text(_join_text)
         if text.strip():
+            n = self._text_layer.selection_count()
             QApplication.clipboard().setText(text)
-            self._toast_text(f"已复制 {len(self._selected)} 字：{text[:40]}")
+            self._toast_text(f"已复制 {n} 字：{text[:40]}")
 
     # ------------------------------------------------ OCR
     def _auto_ocr(self, retry=0):
@@ -371,7 +416,8 @@ class PinWindow(QWidget):
         self._set_boxes([QRect(d["box"][0][0], d["box"][0][1],
                                d["box"][1][0] - d["box"][0][0],
                                d["box"][3][1] - d["box"][0][1]) for d in items],
-                        [d["text"] for d in items])
+                        [d["text"] for d in items],
+                        [d["box"] for d in items])
         if items:
             self._toast_text(f"识别到 {len(items)} 段 · 文字上拖拽选字 · Ctrl+C 复制 · Esc 关闭", 2600)
 
@@ -396,22 +442,36 @@ class PinWindow(QWidget):
         self._set_boxes([QRect(ox + d["box"][0][0], oy + d["box"][0][1],
                                d["box"][1][0] - d["box"][0][0],
                                d["box"][3][1] - d["box"][0][1]) for d in items],
-                        [d["text"] for d in items])
+                        [d["text"] for d in items],
+                        [[[p[0] + ox, p[1] + oy] for p in d["box"]]
+                         for d in items])
         self._toast_text(f"已更新 {len(items)} 段文字")
 
-    def _set_boxes(self, rects, texts):
+    def _set_boxes(self, rects, texts, quads=None):
+        """把识别结果同时喂给两处：
+
+        - `_ocr_boxes`：给翻译链（`_blocks` / `_build_replaced`）用，结构不变
+        - PixPin 文字图层：四角 + 文本 + 置信度，负责选字与高亮
+
+        `quads` 传 OCR 的原始四点（可能是斜的），图层据此做四边形插值；
+        没有时退化为矩形四点。
+        """
         items = []
-        for r, t in zip(rects, texts):
+        for i, (r, t) in enumerate(zip(rects, texts)):
             if not t:
                 continue
-            n = len(t)
-            cw = r.width() / max(1, n)
-            chars = [QRect(int(r.x() + i * cw), r.y(), max(1, int(cw) + 1), r.height())
-                     for i in range(n)]
-            items.append({"box": r, "text": t, "chars": chars})
+            items.append({"box": r, "text": t,
+                          "quad": quads[i] if quads and i < len(quads) else None})
         items.sort(key=lambda it: (it["box"].y() // 12, it["box"].x()))
         self._ocr_boxes = items
-        self._selected = set()   # {(框下标, 字符下标)}
+        self._text_layer.set_boxes([
+            {"quad": it["quad"] if it["quad"] else
+                [[it["box"].x(), it["box"].y()],
+                 [it["box"].right() + 1, it["box"].y()],
+                 [it["box"].right() + 1, it["box"].bottom() + 1],
+                 [it["box"].x(), it["box"].bottom() + 1]],
+             "text": it["text"], "score": it.get("score", 0.0)}
+            for it in items])
         self.update()
 
     # ------------------------------------------------ 视觉行合并成块
@@ -542,54 +602,63 @@ class PinWindow(QWidget):
         p.setRenderHint(QPainter.Antialiasing, True)
         jobs = []
         for blk, trans in zip(blocks, translations):
-            if not trans:
+            # 空/未变的译文：不擦底不重画，原样保留原文像素——绝不因翻译丢内容
+            if not trans or trans == blk["text"]:
                 continue
             rect = blk["rect"].adjusted(-2, -2, 2, 2)
+            fit = self._fit_trans(p, trans, rect, blk["h"])
+            if fit is None:
+                # 译文缩到字号下限仍放不下：整块保留原文。旧实现照擦原文、
+                # 只画放得下的几行，译文一长字段内容就“消失”（用户实测丢字段）
+                continue
             bg = self._sample_bg(img, rect)
             fg = self._sample_fg(img, rect, bg)
-            jobs.append((rect, bg, fg, trans, blk["h"]))
+            jobs.append((rect, bg, fg, fit))
         # 两遍绘制：先全部铺底色、再统一写译文。紧凑排版截图里 OCR 块上下紧挨
         # （行距小于 ±2px 外扩），单块顺序画会让下一块的底色矩形擦掉上一块刚写的译文。
         p.setPen(Qt.NoPen)
-        for rect, bg, _fg, _trans, _h in jobs:
+        for rect, bg, _fg, _fit in jobs:
             p.setBrush(QBrush(bg))
             p.drawRect(rect)
-        for rect, _bg, fg, trans, h in jobs:
-            self._draw_trans_text(p, rect, fg, trans, h)
+        for rect, _bg, fg, fit in jobs:
+            self._draw_trans_text(p, rect, fg, fit)
         p.end()
         pm.setDevicePixelRatio(dpr)   # 恢复 DPR，贴图显示尺寸不变
         return pm
 
-    def _draw_trans_text(self, p: QPainter, rect: QRect, fg: QColor, trans: str, h0: int):
-        """译文逐行显式排版：行进距 = 字高 + 间隙，任何机器/字体上都不重叠。
-
-        旧实现一次 drawText 交由字体自身 lineSpacing 摆行：YaHei 部分字号
-        leading≤0（行距≤字高），不重叠全凭字形没画满 em 框；字体解析不同的
-        机器上行带直接相接，看起来就是重叠。现在行位置自己算，几何上保证间隙。
-
-        纯像素字号（pointSize 受系统 DPI 影响，译文整体偏大约 1/3）：
-        按原行高的 0.72 给值（用户反馈 0.75 略偏大），逐 px 缩到行数×行进距严格放得下。
+    def _fit_trans(self, p: QPainter, trans: str, rect: QRect, h0: int):
+        """译文排版预算：像素字号按原行高 0.80 起（用户实测 0.72 偏小）、
+        逐 px 缩到下限 8，行数×行进距必须完全放进 rect 才算适配（度量取
+        画笔所在设备，与绘制同源）。放不下返回 None，由调用方保留原文——
+        这是“宁可不翻，不能丢内容”的出口。
         """
         w = max(8, rect.width())
-        size = max(8, int(round(h0 * 0.72)))
+        size = max(8, int(round(h0 * 0.80)))
         while True:
             f = QFont(_tr_family())
             f.setPixelSize(size)
             p.setFont(f)
-            fm = p.fontMetrics()          # 度量取画笔所在设备，与实际绘制严格同源
+            fm = p.fontMetrics()
             advance = fm.height() + max(1, size // 8)
             lines = self._wrap_lines(trans, f, w)
-            if size <= 8 or len(lines) * advance <= rect.height():
-                break
+            if len(lines) * advance <= rect.height():
+                return (f, lines, advance, fm.height())
+            if size <= 8:
+                return None
             size -= 1
+
+    def _draw_trans_text(self, p: QPainter, rect: QRect, fg: QColor, fit):
+        """按 _fit_trans 预算好的 (字体, 行, 行进距) 逐行显式排版绘制：
+        行位置自算、几何保证不重叠（不同机器字体解析差异下依然成立）。
+        适配检查已在 _fit_trans 完成，这里整段照画，不再截断行。"""
+        f, lines, advance, fh = fit
+        p.setFont(f)
         p.setPen(QPen(fg, 1))
-        # 极小框缩到下限仍放不下时：只画放得下的整行，宁缺不压行（不再半截字）
         p.setClipRect(rect)
+        w = max(8, rect.width())
         y = rect.top()
         for ln in lines:
-            if y + fm.height() > rect.bottom() + 1:
-                break
-            p.drawText(QRect(rect.left(), y, w, fm.height()),
+            p.drawText(QRect(rect.left(), y, w, fh),
                        Qt.AlignLeft | Qt.AlignTop, ln)
             y += advance
         p.setClipping(False)
@@ -665,7 +734,7 @@ class PinWindow(QWidget):
             menu.addAction(icon("nav_look", "#4E5969"), "翻译（替换原图）", self.translate_replace)
             if self._translated_pix:
                 menu.addAction("显示译文", self.show_translated)
-        if self._selected:
+        if self._text_layer.has_selection():
             menu.addAction(icon("copy", "#4E5969"), "复制选中文字", self._copy_selection)
         if self._ocr_boxes:
             menu.addAction("复制全部文字", self._copy_all_text)
@@ -717,6 +786,8 @@ class PinWindow(QWidget):
 
     # ------------------------------------------------ 绘制：在 BoxLayer 上
     def paint_boxes(self, layer):
+        """只画贴图外框；OCR 文字块与选中高亮由 PixPin 文字图层
+        （OcrTextItemLayer 的 QGraphicsItem）绘制，避免两套坐标系各画一遍。"""
         p = QPainter(layer)
         p.setRenderHint(QPainter.Antialiasing)
         w, h = layer.width(), layer.height()
@@ -724,15 +795,6 @@ class PinWindow(QWidget):
         p.setPen(QPen(QColor(46, 124, 246), 2))
         p.setBrush(Qt.NoBrush)
         p.drawRect(0, 0, w - 1, h - 1)
-        # 选中字符高亮：译文模式同样绘制（OCR 框与替换底色同坐标系，高亮位置一致），
-        # 此前译文模式直接 return，导致翻译后选字无任何视觉反馈、看起来失效
-        for (bi, ci) in self._selected:
-            if bi >= len(self._ocr_boxes):
-                continue
-            r = self._char_widget_rect(bi, ci).translated(-MARGIN, -MARGIN)
-            p.setBrush(QBrush(QColor(46, 124, 246, 120)))
-            p.setPen(Qt.NoPen)
-            p.drawRect(r)
 
     # ------------------------------------------------ 类操作
     @classmethod
@@ -759,7 +821,6 @@ if __name__ == "__main__":
     import sys
 
     import config
-    from PySide6.QtCore import QPoint
     from PySide6.QtGui import QPainter
     from PySide6.QtWidgets import QApplication
 
@@ -848,6 +909,28 @@ if __name__ == "__main__":
     pw2.close_me()
     print("pinwin 自测: 两遍绘制 OK，继续翻译守卫与译文选字…")
 
+    # ---- 翻译不丢内容回归：放不下的译文整块保留原文；译文=原文不动像素
+    pw_t = PinWindow(_make_pix(1.0), QPoint(30, 30), config.load(), None, None)
+    # 极矮块 + 必换行的超长译文：任何字号都放不下 → 原文必须原样保留
+    tiny = [{"rect": QRect(20, 60, 260, 10), "text": "Second line here", "h": 10}]
+    out_t = pw_t._build_replaced(
+        tiny, ["这是一段长得根本放不下必须要换行好几行的超长译文必须整块保留原文不能擦掉原来的任何内容"])
+    out_t.setDevicePixelRatio(1.0)
+    it = out_t.toImage()
+    orig = _make_pix(1.0).toImage()
+    dark_before = sum(1 for x in range(22, 278) for y in range(62, 76)
+                      if orig.pixelColor(x, y).lightness() < 128)
+    dark_after = sum(1 for x in range(22, 278) for y in range(62, 76)
+                     if it.pixelColor(x, y).lightness() < 128)
+    assert dark_before > 0 and dark_after == dark_before, \
+        f"放不下的译文必须保留原文墨迹: {dark_before} -> {dark_after}"
+    # 译文与原文相同：不擦不画（混合语块引擎原样返回时不丢像素）
+    out_e = pw_t._build_replaced(tiny, ["Second line here"])
+    out_e.setDevicePixelRatio(1.0)
+    assert out_e.toImage() == orig, "译文=原文时输出必须与原图逐像素一致"
+    pw_t.close_me()
+    print("pinwin 自测: 翻译不丢内容 OK，继续翻译守卫与译文选字…")
+
     # ---- 翻译守卫：OCR 未完成不静默失败(自动重试)；在途请求去重
     from PySide6.QtCore import QObject, Signal as _Signal
 
@@ -897,12 +980,18 @@ if __name__ == "__main__":
         [{"rect": QRect(20, 20, 260, 22), "text": "The quick brown fox", "h": 20}],
         ["你好，世界。"])
     pw._show_translated = True
-    pw._selected = {(0, 0)}
-    layer = QPixmap(pw._label.size())
-    layer.fill(Qt.transparent)
-    pw.paint_boxes(layer)
-    c = layer.toImage().pixelColor(30, 28)         # 第一个字符矩形内部
-    assert c.alpha() > 0, "译文模式下选中字符应有高亮"
+    # PixPin 文字图层：选中态是字符区间，高亮由 QGraphicsItem 自己绘制
+    pw._set_boxes([QRect(20, 20, 260, 22)], ["The quick brown fox"])
+    item = pw._text_layer.items[0]
+    item.set_selection(4, 8)
+    assert item.selected_text() == "quick", item.selected_text()
+    canvas = QImage(max(1, int(pw._scene.width())),
+                    max(1, int(pw._scene.height())), QImage.Format_ARGB32)
+    canvas.fill(Qt.transparent)
+    pp = QPainter(canvas)
+    pw._scene.render(pp)
+    pp.end()
+    assert canvas.pixelColor(100, 28).alpha() > 0, "译文模式下选中字符应有高亮"
     pw.close_me()
     print("pinwin 自测: 翻译/选字 OK，继续双击禁用与双击 Esc 关闭…")
 
@@ -925,9 +1014,46 @@ if __name__ == "__main__":
     assert pw2 not in PinWindow.instances, "双击 Esc 应关闭贴图"
 
     pw3 = PinWindow(_make_pix(1.0), QPoint(30, 30), config.load(), None, None)
-    pw3._selected = {(0, 0)}
+    pw3._set_boxes([QRect(20, 20, 260, 22)], ["Hello world"])
+    pw3._text_layer.begin_selection(QPointF(25, 30))
+    pw3._text_layer.drag_selection(QPointF(200, 30))
+    pw3._text_layer.end_selection()
+    assert pw3._text_layer.has_selection(), "应已选中文字"
     pw3.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Escape, Qt.NoModifier))
-    assert pw3._selected == set() and pw3 in PinWindow.instances, \
+    assert not pw3._text_layer.has_selection() and pw3 in PinWindow.instances, \
         "有选字时 Esc 应先清选字"
     pw3.close_me()
-    print("pinwin 自测通过: 翻译/选字/双击禁用/双击Esc关闭 全部 OK")
+
+    # ---- 文字图层跨块流式选择（PixPin 字符区间语义）
+    pw4 = PinWindow(_make_pix(1.0), QPoint(30, 30), config.load(), None, None)
+    pw4._set_boxes([QRect(20, 20, 260, 22), QRect(20, 60, 260, 22)],
+                   ["The quick brown fox", "Second line here"])
+    tl = pw4._text_layer
+    assert len(tl.items) == 2, len(tl.items)
+    tl.begin_selection(QPointF(100, 31))          # 第一行中部
+    tl.drag_selection(QPointF(150, 71))           # 第二行中部
+    ranges = tl.selection_ranges()
+    assert len(ranges) == 2, ranges
+    assert ranges[0][2] == 18, f"第一行应从锚点延伸到行尾: {ranges[0]}"
+    assert ranges[1][1] == 0, f"第二行必须从首字开始: {ranges[1]}"
+    assert ranges[1][2] < 15, f"当前列之后的字符不应选中: {ranges[1]}"
+    tl.end_selection()
+    # 反向：从第二行划回第一行
+    tl.clear_selection()
+    tl.begin_selection(QPointF(150, 71))
+    tl.drag_selection(QPointF(100, 31))
+    r2 = tl.selection_ranges()
+    assert len(r2) == 2 and r2[1][1] == 0, r2
+    # 同行只波及一块
+    tl.clear_selection()
+    tl.begin_selection(QPointF(30, 31))
+    tl.drag_selection(QPointF(120, 31))
+    assert len(tl.selection_ranges()) == 1, tl.selection_ranges()
+    # 原地按下：只选 1 个字符（字符区间语义，不是整块）
+    tl.clear_selection()
+    tl.begin_selection(QPointF(30, 31))
+    assert tl.selection_count() == 1, tl.selection_count()
+    # 复制：字符区间回收文本
+    assert tl.selection_text(), tl.selection_text()
+    pw4.close_me()
+    print("pinwin 自测通过: 翻译/文字图层选字/跨块流式/双击禁用/双击Esc关闭 全部 OK")

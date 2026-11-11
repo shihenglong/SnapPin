@@ -239,6 +239,39 @@ class ClipStore:
         return len(ids)
 
 
+def _clipboard_owner_alive() -> bool:
+    """剪贴板所有者进程是否还活着。
+
+    Windows 剪贴板支持「延迟渲染」（数据由源进程按需提供）。源进程退出后，
+    读取会返回 RPC_E_DISCONNECTED（0x80010108）——PySide6 不把它转成 Python
+    异常，而是让整个进程崩掉（实测崩溃点就在 _flush 读 mimeData）。
+    这里先用 Win32 查所有者 PID 是否存活，不存活就跳过本次记录。
+    """
+    import ctypes
+    from ctypes import wintypes
+    u = ctypes.windll.user32
+    k = ctypes.windll.kernel32
+    try:
+        hwnd = u.GetClipboardOwner()
+        if not hwnd:
+            return True                       # 无所有者：数据已实体化
+        pid = wintypes.DWORD()
+        u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if not pid.value:
+            return True
+        h = k.OpenProcess(0x1000, False, pid.value)   # QUERY_LIMITED_INFORMATION
+        if not h:
+            return False                      # 进程已退出
+        try:
+            code = wintypes.DWORD()
+            k.GetExitCodeProcess(h, ctypes.byref(code))
+            return code.value == 259          # STILL_ACTIVE
+        finally:
+            k.CloseHandle(h)
+    except Exception:
+        return True                           # 检查失败不阻塞正常记录
+
+
 class ClipMonitor(QObject):
     """监听系统剪贴板 dataChanged → 50ms 合并后落库（仅主线程）。"""
     changed = Signal(int)  # 新条目 clip_id
@@ -279,13 +312,29 @@ class ClipMonitor(QObject):
             self._suppress = 0  # 残留抑制已过期：这条是真实复制，正常记录
         self._timer.start()  # 单发重置 → 连续触发合并为一次落库
 
+    # 只读这些标准格式：`md.formats()` 会把剪贴板里的**私有/延迟渲染格式**
+    # 也列出来，逐个取数据时若源对象已失效，Win32 抛 RPC_E_DISCONNECTED
+    # (0x80010108)，PySide6 不转成 Python 异常而是直接让进程崩掉
+    # （实测崩溃点就在遍历 formats 的 md.data() 上）。
+    _CLIP_FORMATS = ("text/plain", "text/html", "text/uri-list",
+                     "image/png", "image/bmp", "image/jpeg", "image/webp",
+                     "image/tiff", "image/gif")
+
     def _flush(self):
+        # 源进程已退出的延迟渲染剪贴板：读下去会让进程崩（RPC_E_DISCONNECTED）
+        if not _clipboard_owner_alive():
+            return
         md = QApplication.clipboard().mimeData()
         if md is None:
             return
         formats = {}
-        for fmt in md.formats():
-            ba = md.data(fmt)
+        for fmt in self._CLIP_FORMATS:
+            try:
+                if not md.hasFormat(fmt):
+                    continue
+                ba = md.data(fmt)
+            except Exception:
+                continue                     # 单个格式读失败不影响整条记录
             if ba is not None and ba.size() > 0:
                 formats[fmt] = bytes(ba)
         # 平台对 application/x-qt-image 可能给不出字节（延迟渲染/离屏等）：

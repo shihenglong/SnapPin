@@ -12,11 +12,12 @@ from ctypes import wintypes
 
 from PySide6.QtCore import (QByteArray, QEvent, QMimeData, QPoint, QSize, Qt,
                             QTimer, Signal)
-from PySide6.QtGui import QColor, QCursor, QIcon, QImage, QPainter, QPixmap
+from PySide6.QtGui import (QColor, QCursor, QIcon, QImage, QPainter, QPainterPath,
+                           QPixmap)
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QLineEdit,
-                               QListWidget, QListWidgetItem, QMenu, QToolButton,
-                               QVBoxLayout, QWidget)
+                               QListWidget, QListWidgetItem, QMenu, QStyle,
+                               QStyleOption, QToolButton, QVBoxLayout, QWidget)
 
 import config
 from clip import ClipItem, ClipStore
@@ -25,17 +26,17 @@ ACCENT = "#2E7CF6"
 _ELIDE_W = 230          # 预览文本省略宽度（窗口定宽，按可用宽度估算）
 
 QSS = """
-#ClipWin{background:white;border:1px solid #DADDE4;}
-#ClipTop{background:white;border-bottom:1px solid #EFEFF2;}
+#ClipWin{background:white;border:1px solid #AEB8C6;border-radius:10px;}
+#ClipTop{background:transparent;border-bottom:1px solid #EFEFF2;}
 #ClipTitle{color:#4E5969;font-size:12px;background:transparent;}
 QToolButton#SideBtn{border:none;border-radius:6px;background:transparent;padding:2px;}
 QToolButton#SideBtn:hover{background:#E9EDF4;}
 QToolButton#SideBtn[active="true"]{background:#EAF2FF;}
-#ClipList{background:white;border:none;outline:0;font-size:13px;}
+#ClipList{background:transparent;border:none;outline:0;font-size:13px;}
 #ClipList::item{border-radius:6px;margin:1px 4px;}
 #ClipList::item:hover{background:#F2F7FF;}
 #ClipList::item:selected{background:#EAF2FF;}
-#ClipBottom{background:#FAFBFC;border-top:1px solid #E5E6EB;}
+#ClipBottom{background:transparent;border-top:1px solid #E5E6EB;}
 #ClipSearch{border:1px solid #E5E6EB;border-radius:14px;background:white;
             padding:4px 10px 4px 28px;font-size:12px;}
 #ClipSearch:focus{border-color:%ACC%;}
@@ -227,8 +228,18 @@ class _SideBar(QWidget):
 
     def paintEvent(self, e):
         p = QPainter(self)
+        # 贴着窗口圆角裁剪：右上下角若按矩形填满，会在窗口圆角外露出方形底色
+        path = QPainterPath()
+        path.addRoundedRect(0.0, 0.0, float(self.width()), float(self.height()),
+                            10.0, 10.0)
+        p.setClipPath(path)
         p.fillRect(self.rect(), QColor("#FAFBFC"))
+        p.setClipping(False)
         p.fillRect(0, 0, 1, self.height(), QColor("#ECEEF2"))  # 左分隔线
+        # 右缘即窗口边框右段（窗口贴边无其他控件画到最右 1px），跟随圆角裁剪
+        p.setClipping(True)
+        p.fillRect(self.width() - 1, 0, 1, self.height(), QColor("#AEB8C6"))
+        p.setClipping(False)
         # 底部锁定状态指示条（锁定 = 主题蓝）
         color = QColor(ACCENT) if self._locked else QColor("#D5DAE3")
         p.setPen(Qt.NoPen)
@@ -353,6 +364,7 @@ class ClipWindow(QWidget):
 
         self.setObjectName("ClipWin")
         self.setWindowFlags(Qt.Tool | Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)  # 真圆角：窗口四角透明
         self.setFixedSize(360, 500)
         self.setWindowTitle("剪贴板历史")
         self.setStyleSheet(QSS)
@@ -434,6 +446,14 @@ class ClipWindow(QWidget):
 
         self._sync_lock_btn()
         self.refresh()
+
+    def paintEvent(self, _):
+        # 纯 QWidget 子类不会自动绘制 QSS 背景/边框（旧 1px 边框从未画出来过，
+        # 白底窗口上等于没有边）——必须自己画 PE_Widget，圆角底 + 边框才生效
+        opt = QStyleOption()
+        opt.initFrom(self)
+        p = QPainter(self)
+        self.style().drawPrimitive(QStyle.PE_Widget, opt, p, self)
 
     # ------------------------------------------------ 弹出
     def popup(self):
@@ -989,7 +1009,6 @@ if __name__ == "__main__":
     import sys
     import tempfile
 
-    import config
     config.save = lambda c: None  # 自测不写真实配置文件
 
     app = QApplication([])

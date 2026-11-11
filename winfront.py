@@ -30,6 +30,11 @@ def force_front(widget) -> bool:
         if u32.GetForegroundWindow() == hwnd:
             return True
         # 第二轮：挂输入队列 + TOPMOST 抬升
+        # 托盘菜单路径下菜单刚关闭、前台权限已过期，后台进程直接
+        # SetForegroundWindow 会被前台锁静默拒绝——先模拟一次 ALT 击键，
+        # 让系统认为有用户输入（窗口管理器通用的绕过手法）。
+        u32.keybd_event(0x12, 0, 0, 0)          # ALT down
+        u32.keybd_event(0x12, 0, 2, 0)          # ALT up（KEYEVENTF_KEYUP）
         this_tid = k32.GetCurrentThreadId()
         tids = []
         for w in (u32.GetForegroundWindow(), hwnd):
@@ -58,7 +63,6 @@ def force_front(widget) -> bool:
 if __name__ == "__main__":
     # 真桌面自测（offscreen 无 Z 序，必须真窗口）：QT 不设 offscreen 直接跑本文件。
     # 模拟用户场景：后台进程（终端在前台）由 QTimer 弹设置窗 → 应自动到最前。
-    import os
     import sys
 
     from PySide6.QtCore import QTimer

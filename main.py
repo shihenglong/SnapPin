@@ -21,10 +21,10 @@ if sys.stderr is None:            # pythonw/打包 exe 无控制台：重定向�
 if sys.stderr is not None:
     faulthandler.enable()         # 崩溃栈也会写进日志
 
-from PySide6.QtCore import QObject, QPoint, QRect, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QObject, QRect, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QIcon, QPixmap
-from PySide6.QtWidgets import (QApplication, QMenu, QMessageBox, QSystemTrayIcon,
-                               QWidget)
+from PySide6.QtWidgets import (QApplication, QMenu, QMessageBox,
+                               QSystemTrayIcon)
 
 import config
 from icons import APP_ICON_SVG
@@ -52,24 +52,53 @@ def app_icon() -> QIcon:
 
 
 class SingleInstance:
+    """单实例守卫：命名互斥体判唯一性，本地套接字只负责「第二次启动时
+    通知首个实例打开设置」。
+
+    旧实现只靠 QLocalSocket 探测：`waitForConnected(300)` 在冷启动/杀毒
+    扫描下会超时，于是第二进程误判自己是首个实例，还对**正在运行的实例**
+    执行 QLocalServer.removeServer() —— 两个实例并存，抢热键、抢托盘，
+    表现为「快捷键失效 + 托盘图标消失」。互斥体不受连接时序影响。
+    """
     name = "SnapPin-Instance-7f2a"
+    _ERROR_ALREADY_EXISTS = 183
 
     def __init__(self, on_second):
-        from PySide6.QtNetwork import QLocalServer, QLocalSocket
-        self._sock = QLocalSocket()
-        if self._sock.connectToServer(self.name) and self._sock.waitForConnected(300):
-            self._sock.disconnectFromServer()
-            self.is_first = False
-            self.on_second = on_second  # 通知已有实例
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        k32.CreateMutexW.restype = ctypes.c_void_p
+        # handle 必须保活到进程结束：存成属性，交由 Python 对象生命周期持有
+        self._mutex = k32.CreateMutexW(None, False, "Local\\" + self.name)
+        already = (k32.GetLastError() == self._ERROR_ALREADY_EXISTS) \
+            if self._mutex else False
+        self.is_first = not already
+        self.on_second = on_second
+        if not self.is_first:
+            self._notify_first()          # 已有实例：通知它打开设置后立刻退出
             return
-        if self._sock.error() == QLocalSocket.ConnectionRefusedError:
-            QLocalServer.removeServer(self.name)
+        from PySide6.QtNetwork import QLocalServer
+        QLocalServer.removeServer(self.name)   # 清理上次异常退出残留的管道
         self.server = QLocalServer()
-        self.server.newConnection.connect(lambda: (
-            self.server.nextPendingConnection().readAll(),
-            on_second()))
+        self.server.newConnection.connect(self._on_conn)
         self.server.listen(self.name)
-        self.is_first = True
+
+    def _on_conn(self):
+        c = self.server.nextPendingConnection()
+        if c is not None:
+            c.readAll()
+            c.disconnectFromServer()
+        if self.on_second:
+            self.on_second()
+
+    def _notify_first(self):
+        from PySide6.QtNetwork import QLocalSocket
+        s = QLocalSocket()
+        s.connectToServer(self.name)
+        if s.waitForConnected(1500):
+            s.write(b"show")
+            s.flush()
+            s.waitForBytesWritten(300)
+            s.disconnectFromServer()
 
 
 class App:
@@ -131,14 +160,22 @@ class App:
 
     @staticmethod
     def _warm_modules():
-        """后台线程预 import 截图/贴图模块（numpy 等大依赖），
-        首次按热键时只剩抓屏一步同步开销。"""
+        """后台线程预 import 截图/贴图模块（numpy 等大依赖），并预热 OCR 模型。
+
+        首次按热键时只剩抓屏一步同步开销；OCR 的 ONNX session 加载要 1~2 秒，
+        放在这里预热后，用户钉图取字不用再等。"""
         def _do():
             for name in ("capture", "pinwin"):
                 try:
                     __import__(name)
                 except Exception:
                     pass
+            try:
+                import ocr as _ocr
+                if _ocr.available():
+                    _ocr.OcrRunner().warmup()
+            except Exception:
+                pass
         threading.Thread(target=_do, daemon=True, name="snappin-warmup").start()
 
     # ------------------------------------------------ 托盘
@@ -412,12 +449,28 @@ class App:
 
     # ------------------------------------------------ 设置
     def open_settings(self):
-        """非模态单例：已打开则激活；不阻塞截图/贴图/热键等任何窗口。"""
-        from settings_ui import SettingsDialog
-        if self._settings_dlg is None:
-            self._settings_dlg = SettingsDialog(self.cfg, self._apply_settings)
-            self._settings_dlg._app = self  # 扩展设置页回调（打开密码管理等）
-        self._settings_dlg.show_up()
+        """非模态单例：已打开则激活；不阻塞截图/贴图/热键等任何窗口。
+
+        pythonw 没有控制台，托盘槽里的异常会被静默吞掉（表现为「点了没
+        反应」）——这里落盘日志 + 托盘气泡提示，不再无声失败。"""
+        try:
+            from settings_ui import SettingsDialog
+            if self._settings_dlg is None:
+                self._settings_dlg = SettingsDialog(self.cfg, self._apply_settings)
+                self._settings_dlg._app = self  # 扩展设置页回调（打开密码管理等）
+            self._settings_dlg.show_up()
+        except Exception:
+            import os
+            import traceback
+            log = os.path.join(os.environ.get("TEMP", os.getcwd()),
+                               "SnapPin_error.log")
+            try:
+                with open(log, "a", encoding="utf-8") as f:
+                    f.write(traceback.format_exc() + "\n")
+            except OSError:
+                pass
+            self.tray.showMessage("SnapPin", f"打开设置失败，详见 {log}",
+                                  QSystemTrayIcon.Warning, 4000)
 
     def _apply_settings(self):
         config.save(self.cfg)
@@ -448,6 +501,11 @@ class App:
 
 
 def main():
+    # 防呆：环境里若带着 QT_QPA_PLATFORM=offscreen（CI / 某些 shell 会导出），
+    # 主程序会静默进入离屏模式——没有托盘图标、窗口不可见、热键按下去也没
+    # 反应，表现就是「启动了但什么都没有」。除显式要求外一律清掉。
+    if os.environ.get("QT_QPA_PLATFORM", "").lower() == "offscreen":
+        os.environ.pop("QT_QPA_PLATFORM", None)
     qapp = QApplication(sys.argv)
     qapp.setApplicationName("SnapPin")
     # 强制浅色调色板：系统深色模式下，原生弹出层（下拉列表/tooltip）不再黑底白字失明
