@@ -144,6 +144,8 @@ class LongshotPreview(QWidget):
     ——面板常盖住滚动条，不穿透就没法拖着滚（用户明确要求）。"""
 
     V_W = 204                    # 竖向面板宽度（内容 200 + 边框/边距 4）
+    MAX_W = 460                  # 横向面板最大宽度：长图变长时固定住，内部滚动
+    MAX_H = 560                  # 竖向面板最大高度
     CAP_V_W = 200                # 竖向目标内容宽（缩放基准）
     CAP_H_H = 150                # 横向目标内容高（缩放基准，用户要求再缩小）
     HOVER_OPACITY = 0.22         # 悬停时的不透明度
@@ -253,11 +255,13 @@ class LongshotPreview(QWidget):
         scr = self.screen() or QApplication.primaryScreen()
         g = scr.availableGeometry() if scr else None
         if self._hdir:
-            w = min(pix.width() + self.PAD, (g.width() - 60) if g else pix.width() + self.PAD)
+            # 横向：高度由内容定，宽度封顶（长图越来越长不该把面板撑穿屏幕）
+            avail = (g.width() - 60) if g else self.MAX_W
+            w = min(pix.width() + self.PAD, self.MAX_W, avail)
             self.setFixedSize(max(120, w), pix.height() + self.PAD)
         else:
-            h = min(pix.height() + self.PAD,
-                    (g.height() - 90) if g else pix.height() + self.PAD)
+            avail = (g.height() - 90) if g else self.MAX_H
+            h = min(pix.height() + self.PAD, self.MAX_H, avail)
             self.setFixedSize(self.V_W, max(90, h))
         sb = (self.scroll.horizontalScrollBar() if self._hdir
               else self.scroll.verticalScrollBar())
