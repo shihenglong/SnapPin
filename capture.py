@@ -279,6 +279,13 @@ class LongshotPreview(QWidget):
         else:
             self.status.hide()
 
+    def closeEvent(self, ev):
+        # 悬停轮询定时器必须随窗口停掉：窗口销毁后回调仍会访问已释放对象
+        # （自测退出码 0xC0000409 就是它）
+        if getattr(self, "_hover_timer", None) is not None:
+            self._hover_timer.stop()
+        super().closeEvent(ev)
+
     def clear(self):
         self.lab.clear()
         self.lab.setText("滚动页面\n开始拼接")
