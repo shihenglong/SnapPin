@@ -1841,7 +1841,7 @@ class CaptureOverlay(QWidget):
         if frame is None:
             return
         self._pp = longshot_pixpin.PixPinLongShot(1 if self._ls_dir == "h" else 0)
-        self._pp.update_reference(frame)
+        self._pp.feed(frame)
         self._ls_stitched = self._pp.canvas
         self._ls_len = int(self._pp.canvas.shape[0])
         self._ls_prev = (frame if self._ls_dir == "v"
@@ -1912,30 +1912,27 @@ class CaptureOverlay(QWidget):
         对齐 `doMatch`(0x1400C7470)：抓帧 → `findOffset` → **status 0 才拼**。
         status 1（到底 / 无新内容）与 2（未匹配）都不改动长图——PixPin 没有
         任何「硬衔接」或兜底拼接，对不上就等下一帧。
-        """
+
+"""
         if not self._longshot or self._ls_stitched is None or self._ls_full:
-            return
-        eng = self._pp
-        if eng is None or not eng.has_ref:
             return
         cur = self._grab_frame_rgb()
         if cur is None:
             return
-        status, offset, conf = eng.find_offset(cur)
+        st, off, conf = self._pp.feed(cur)
         self._ls_conf = conf
-        if status == longshot_pixpin.ERR_OK:
-            eng.compose(cur, offset)
-            self._ls_stitched = eng.canvas
-            self._ls_len = int(eng.canvas.shape[0])
-            self._ls_view = offset
+        if st == longshot_pixpin.ERR_OK:
+            self._ls_stitched = self._pp.canvas
+            self._ls_len = int(self._pp.canvas.shape[0])
+            self._ls_view = off
             self._ls_prev = (cur if self._ls_dir == "v"
-                             else np.ascontiguousarray(np.rot90(cur, k=-1)))
+                             else np.ascontiguousarray(cur.transpose(1, 0, 2)))
             self._ls_miss = 0
             self._update_preview()
             # 长图内存保护：PixPin 每帧整图重拷、不设上限；这里到 150MB 停
-            if int(eng.canvas.nbytes) > 150 * 1024 * 1024:
+            if int(self._pp.canvas.nbytes) > 150 * 1024 * 1024:
                 self._ls_full = True
-        elif status == longshot_pixpin.ERR_BOTTOM:
+        elif st == longshot_pixpin.ERR_BOTTOM:
             self._ls_miss = getattr(self, "_ls_miss", 0) + 1
         else:
             self._ls_rejected += 1

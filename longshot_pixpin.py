@@ -21,7 +21,7 @@ PixPin.exe，每条结论带函数地址与伪码摘录）。目标是把 PixPin
 - 位移投票 `unordered_map<int,int>`，冠军按票数
 - 唯一候选 → 置信度 1.0；否则 `(top − runnerUp) / (top + runnerUp)`，须 **≥ 0.5**
 - 搜索窗口 `[last_offset − block, last_offset + 2×block)`，`block` = 上一帧高
-- 绝对位移 = 窗口起点 + 冠军 Δ；负值截 0，写回作下帧锚点
+- 绝对位移 = 窗口起点 + 冠军 Δ（负值=上滚/左滚，保留原样）
 - 失败码：`1` = 到底（画布无空间）、`2` = 未匹配
 - 横向 = `cv::rotate` 90° 顺时针 → 复用纵向 → 拼完逆时针转回
 - 抓帧周期 **100 ms**（由调用方定时器驱动，本模块不建定时器）
@@ -107,6 +107,8 @@ class PixPinLongShot:
         self.has_ref = False          # inner+0xB8
         self.canvas = None            # 长图（RGB，纵向模式；横向为转置态）
         self.status = ERR_OK
+        self._prev_pipe = None        # 上一帧的管线态（固定带检测用）
+        self._fixed = None            # 固定带 (a, b)，None = 未检测/无
 
     # ------------------------------------------------------------ 工具
     def _to_pipeline(self, frame_rgb: np.ndarray) -> np.ndarray:
@@ -123,17 +125,23 @@ class PixPinLongShot:
 
     # ------------------------------------------------------------ 参考登记
     def update_reference(self, frame_rgb: np.ndarray):
-        """`0x1400CE340`：首帧（或重建参考）时登记行投影与帧高。"""
-        prof = row_profile(self._to_pipeline(frame_rgb))
+        self.update_reference_pipe(self._to_pipeline(frame_rgb))
+
+    def update_reference_pipe(self, pipe: np.ndarray):
+        """`0x1400CE340`：首帧（或重建参考）时登记行投影与帧高（管线态）。"""
+        prof = row_profile(pipe)
         self.m_prof = prof
         self.block = int(prof.shape[0])
         self.last_offset = INIT_OFFSET
         self.has_ref = True
-        self.canvas = self._to_pipeline(frame_rgb).copy()
+        self.canvas = pipe.copy()
         self.status = ERR_OK
 
     # ------------------------------------------------------------ 位移搜索
     def find_offset(self, frame_rgb: np.ndarray):
+        return self.find_offset_pipe(self._to_pipeline(frame_rgb))
+
+    def find_offset_pipe(self, pipe: np.ndarray):
         """`0x1400CE530`：搜索窗口内 knnMatch(k=1) → 位移投票。
 
         返回 (status, offset, confidence)：
@@ -141,7 +149,7 @@ class PixPinLongShot:
         - status 1 = 到底（画布没有新空间）
         - status 2 = 未匹配（候选为空 / 置信度不足）
         """
-        prof = row_profile(self._to_pipeline(frame_rgb))
+        prof = row_profile(pipe)
         n = int(prof.shape[0])
         if self.m_prof is None or n < 8:
             return ERR_NO_MATCH, 0, 0.0
@@ -198,13 +206,17 @@ class PixPinLongShot:
 
     # ------------------------------------------------------------ 拼接
     def compose(self, frame_rgb: np.ndarray, offset: int):
-        """把当前帧按绝对位移 offset 写入长图（`0x1400CDFB0` + `0x1400CDA00`）。
+        self.compose_pipe(self._to_pipeline(frame_rgb), offset)
+        return self.canvas
+
+    def compose_pipe(self, pipe: np.ndarray, offset: int):
+        """把管线态当前帧按绝对位移 offset 写入长图（`0x1400CDFB0` + `0x1400CDA00`）。
 
         语义与 PixPin 的逐行 memcpy 一致：目标行 = 源行 + offset，重叠部分被
         新帧覆盖、没有单独的相似度去重；只是这里只写「新增段」，避免每帧
         整图拷贝。
         """
-        img = self._to_pipeline(frame_rgb)
+        img = pipe
         if self.canvas is None:
             self.canvas = img.copy()
             self.m_prof = row_profile(self.canvas)
@@ -233,6 +245,66 @@ class PixPinLongShot:
         if self.canvas is None:
             return None
         return self._from_pipeline(self.canvas)
+
+    # -------------------------------------------------- 固定带（屏幕固定件）
+    FIXED_MIN_ROWS = 24      # 连续不变的行数达到它才算固定带
+
+    def _detect_fixed(self, prev_pipe, cur_pipe):
+        """连续帧中几乎不变的连续行带（屏幕固定件：吸顶栏/固定右侧栏）。
+
+        横向滚动时网页的固定右侧栏在每帧的相同屏幕位置，逐帧整帧拼接会让
+        它在长图里反复出现（用户实测「黑色区域一直变宽」）。检测出来后在
+        管线态里把它挖掉，拼接与预览就只剩内容区。"""
+        if prev_pipe is None or prev_pipe.shape != cur_pipe.shape:
+            return None
+        d = np.abs(cur_pipe.astype(np.int16)
+                   - prev_pipe.astype(np.int16)).mean(axis=(1, 2))
+        quiet = d < 2.0
+        best, bs, s = 0, None, None
+        for i, q in enumerate(quiet):
+            if q and s is None:
+                s = i
+            elif not q and s is not None:
+                if i - s > best:
+                    best, bs = i - s, s
+                s = None
+        if s is not None and len(quiet) - s > best:
+            best, bs = len(quiet) - s, s
+        # 全帧都不变（静止帧 prev==cur）时 best 会等于整帧：那不是固定件，
+        # 而是没有新内容——返回 None，避免把帧裁成空。
+        if best >= self.FIXED_MIN_ROWS and best < int(quiet.size) - self.FIXED_MIN_ROWS:
+            return (bs, bs + best)
+        return None
+
+    def _strip_rows(self, img: np.ndarray, band):
+        """从管线态图（拼接轴 = axis0）中挖掉固定带行 [a:b)。"""
+        a, b = band
+        return np.ascontiguousarray(np.concatenate([img[:a], img[b:]], axis=0))
+
+    def feed(self, frame_rgb: np.ndarray):
+        """PixPin 的 doMatch 全流程（`0x1400C7470`）：管线 → 裁固定带 →
+        find_offset → compose。返回 (status, offset, conf)。
+
+        status 0 时长图已更新；首帧走 update_reference_pipe 登记参考。"""
+        pipe = self._to_pipeline(frame_rgb)
+        if self._fixed is None and self.has_ref and self._prev_pipe is not None \
+                and self._prev_pipe.shape == pipe.shape:
+            band = self._detect_fixed(self._prev_pipe, pipe)
+            if band:
+                self._fixed = band
+                # 一次性从画布与参考投影中挖掉固定带行（后续帧同样裁）
+                self.canvas = self._strip_rows(self.canvas, band)
+                self.m_prof = self._strip_rows(self.m_prof, band)
+        pipe = self._strip_rows(pipe, self._fixed) if self._fixed else pipe
+        self._prev_pipe = pipe
+        if not self.has_ref:
+            self.update_reference_pipe(pipe)
+            return ERR_OK, 0, 1.0
+        st, off, conf = self.find_offset_pipe(pipe)
+        if st == ERR_OK:
+            self.compose_pipe(pipe, off)
+        self.status = st
+        return st, off, conf
 
 
 # ---------------------------------------------------------------- 自测
@@ -281,13 +353,13 @@ if __name__ == "__main__":                               # pragma: no cover
         eng = PixPinLongShot(0)
         eng.update_reference(frame_of(page, 900, H))
         st, s, conf = eng.find_offset(frame_of(page, 900 + off, H))
-        # 上滚：cur[k] = ref[k+off]，off<0 → 绝对位移原始为负，PixPin 截 0
-        raw_ok = (s == 0) if off < 0 else True
-        good = (st in (ERR_OK, ERR_BOTTOM)) and raw_ok
+        # 上滚：cur[k] = ref[k+off]，off<0 → 绝对位移保留负值原样返回
+        # （`*param_3 = iVar11`），由调用方决定前插/忽略
+        good = (st == ERR_OK and s == off)
         ok += good
         total += 1
         print(f"  上滚 Δ={off:4d} -> status={st} offset={s:5d} conf={conf:.3f} "
-              f"{'OK(负位移截0，同 PixPin)' if good else 'FAIL'}")
+              f"{'OK(负位移保留)' if good else 'FAIL'}")
 
     print("=== 静止帧 ===")
     eng = PixPinLongShot(0)
