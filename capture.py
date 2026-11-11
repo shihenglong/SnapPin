@@ -102,7 +102,7 @@ class CaptureToolbar(QWidget):
         eff = QGraphicsDropShadowEffect(self)
         eff.setBlurRadius(16)
         eff.setOffset(0, 2)
-        eff.setColor(QColor(0, 0, 0, 52))
+        eff.setColor(QColor(0, 0, 0, 150))
         self.setGraphicsEffect(eff)
         # 参考 PixPin 截图工具栏：白色圆角胶囊 + 浅描边 + 图标按钮 hover 提亮
         self.setStyleSheet(
@@ -111,7 +111,7 @@ class CaptureToolbar(QWidget):
             "QToolButton{border:none;border-radius:7px;padding:2px;background:white;}"
             "QToolButton:hover{background:#F2F3F5;}"
             "QToolButton[active=\"true\"]{background:#EAF2FF;}"
-            "QToolButton:disabled{color:rgba(0,0,0,.35);}")
+            "QToolButton:disabled{color:rgba(0,0,0,89);}")
         self.adjustSize()
 
     def _pick(self, c):
@@ -143,13 +143,16 @@ class LongshotPreview(QWidget):
     滚动跟随当前视口，绿框标出视口段。鼠标移上去时整窗变淡并**点击穿透**
     ——面板常盖住滚动条，不穿透就没法拖着滚（用户明确要求）。"""
 
-    V_W = 200                    # 竖向面板宽度（原 132 太窄，缩略图看不清）
-    H_H = 232                    # 横向面板高度（原 170）
+    V_W = 192                    # 竖向面板宽度（内容 180 + 左右边距 12）
+    CAP_V_W = 180                # 竖向目标内容宽（缩放基准）
+    CAP_H_H = 172                # 横向目标内容高（缩放基准）
     HOVER_OPACITY = 0.22         # 悬停时的不透明度
+    PAD = 11                     # 上下边距合计（contentsMargins 6+5）
 
     def __init__(self):
         super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setWindowTitle("SnapPin 长截图预览")
+        self.setAttribute(Qt.WA_StyledBackground, True)
         self.setAttribute(Qt.WA_TranslucentBackground, False)
         col = QVBoxLayout(self)
         col.setContentsMargins(6, 6, 6, 5)
@@ -178,7 +181,7 @@ class LongshotPreview(QWidget):
         self.setStyleSheet(
             "LongshotPreview{background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
             "stop:0 #1C2230,stop:1 #12161D);"
-            "border:1px solid rgba(46,124,246,0.42);border-radius:12px;}")
+            "border:1px solid rgba(46,124,246,107);border-radius:12px;}")
         eff = QGraphicsDropShadowEffect(self)
         eff.setBlurRadius(24)
         eff.setOffset(0, 5)
@@ -228,12 +231,11 @@ class LongshotPreview(QWidget):
         if self._frozen:
             return
         self._hdir = hdir
+        # 缩放基准是"目标内容尺寸"，与窗口当前大小无关，保证比例恒定
         if hdir:
-            # 横向：选区高度映射到面板内高，宽度随内容延伸
-            self._scale = (self.H_H - 60) / max(1, sel_h)
+            self._scale = self.CAP_H_H / max(1, sel_h)
         else:
-            # 竖向：选区宽度映射到面板内宽，高度随内容延伸
-            self._scale = (self.V_W - 20) / max(1, sel_w)
+            self._scale = self.CAP_V_W / max(1, sel_w)
         self._frozen = True
 
     def unfreeze(self):
@@ -253,13 +255,16 @@ class LongshotPreview(QWidget):
         self.lab.setPixmap(pix)
         self.lab.resize(max(1, pix.width()), max(1, pix.height()))
         # 窗口长/宽不固定：随内容延伸，夹在屏幕可用区内（超出后内部滚动）
+        # 窗口**精确贴合**内容：宽/高 = 图尺寸 + 真实边距（PAD / 12）。
+        # 旧算式 +34/+22 是状态行还在时的遗留值，比实际边距大 → 面板留黑边。
         scr = self.screen() or QApplication.primaryScreen()
         g = scr.availableGeometry() if scr else None
         if self._hdir:
-            w = min(pix.width() + 22, (g.width() - 60) if g else pix.width() + 22)
-            self.setFixedSize(max(120, w), self.H_H)
+            w = min(pix.width() + 12, (g.width() - 60) if g else pix.width() + 12)
+            self.setFixedSize(max(120, w), pix.height() + self.PAD)
         else:
-            h = min(pix.height() + 34, (g.height() - 90) if g else pix.height() + 34)
+            h = min(pix.height() + self.PAD,
+                    (g.height() - 90) if g else pix.height() + self.PAD)
             self.setFixedSize(self.V_W, max(90, h))
         sb = (self.scroll.horizontalScrollBar() if self._hdir
               else self.scroll.verticalScrollBar())
@@ -293,31 +298,39 @@ class LongshotToolbar(QWidget):
     sig_finish = Signal()
     sig_pin = Signal()
 
-    _BTN_QSS = ("QToolButton{border:none;border-radius:7px;background:transparent;}"
-                "QToolButton:hover{background:#F0F2F5;}"
-                "QToolButton:pressed{background:#E4E7EC;}")
-    _BTN_RUN_QSS = ("QToolButton{border:none;border-radius:7px;background:#FDECEC;}"
+    # 与 CaptureToolbar 同一套视觉：白底、同图标色、同 hover
+    ICON_COLOR = "#4E5969"
+    _BTN_QSS = ("QToolButton{border:none;border-radius:7px;padding:2px;"
+                "background:white;}"
+                "QToolButton:hover{background:#F2F3F5;}"
+                "QToolButton:pressed{background:#E8EBF0;}")
+    _BTN_RUN_QSS = ("QToolButton{border:none;border-radius:7px;"
+                    "background:#FDECEC;}"
                     "QToolButton:hover{background:#FBDDDD;}")
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("lsBar")
+        # QWidget 子类默认不绘制 QSS 的 background，必须打开这个属性，
+        # 否则深色卡片永远画不出来（白底会与白色网页融为一体）
+        self.setAttribute(Qt.WA_StyledBackground, True)
         self._dir = "v"
         row = QHBoxLayout(self)
-        row.setContentsMargins(8, 5, 7, 5)
-        row.setSpacing(5)
+        row.setContentsMargins(4, 3, 4, 3)
+        row.setSpacing(1)
         self.size_lab = QLabel("0 × 0")
         self.size_lab.setStyleSheet(
-            "background:#F2F3F5;color:#4E5969;border-radius:6px;"
-            "padding:3px 8px;font-size:12px;font-weight:600;")
+            "background:#F2F3F5;color:#4E5969;border-radius:5px;"
+            "padding:2px 9px;font-size:12px;font-weight:600;"
+            "font-family:'Segoe UI','Microsoft YaHei UI';")
         row.addWidget(self.size_lab)
         row.addWidget(self._sep())
 
-        def ibtn(name, tip, color="#4E5969"):
+        def ibtn(name, tip, color=LongshotToolbar.ICON_COLOR):
             b = QToolButton(self)
-            b.setIcon(icon(name, color, 19))
-            b.setIconSize(QSize(19, 19))
-            b.setFixedSize(32, 30)
+            b.setIcon(icon(name, color, 20, 1.6))
+            b.setIconSize(QSize(20, 20))
+            b.setFixedSize(28, 28)
             b.setCursor(Qt.PointingHandCursor)
             b.setFocusPolicy(Qt.NoFocus)
             b.setToolTip(tip)
@@ -352,13 +365,14 @@ class LongshotToolbar(QWidget):
         self.btn_up.clicked.connect(lambda: self.sig_auto.emit(-1))
         self.btn_down.clicked.connect(lambda: self.sig_auto.emit(1))
         self.btn_close.clicked.connect(self.sig_close.emit)
-        eff = QGraphicsDropShadowEffect(self)
-        eff.setBlurRadius(16)
-        eff.setOffset(0, 2)
-        eff.setColor(QColor(0, 0, 0, 52))
-        self.setGraphicsEffect(eff)
+        # 不用 QGraphicsDropShadowEffect：作用在**顶层窗口**上会让 Qt 走离屏
+        # 渲染，实测只画出部分子控件（屏幕上只剩一条灰条）。用更明显的描边
+        # 代替阴影，保证在白色网页上也看得出边界。
+        # 与普通截图工具栏同一套：白色圆角胶囊 + 浅描边 + 图标按钮 hover 提亮
         self.setStyleSheet(
-            "#lsBar{background:white;border:1px solid #E3E6EB;border-radius:10px;}")
+            "#lsBar{background:white;border:1px solid #D5DAE2;border-radius:9px;}"
+            "QToolButton{border:none;border-radius:7px;padding:2px;background:white;}"
+            "QToolButton:hover{background:#F2F3F5;}")
 
     def _sep(self):
         w = QWidget(self)
@@ -369,7 +383,8 @@ class LongshotToolbar(QWidget):
     def set_dir(self, d: str):
         self._dir = d
         vertical = d == "v"
-        self.btn_dir.setIcon(icon("dir_v" if vertical else "dir_h", "#4E5969", 18))
+        self.btn_dir.setIcon(icon("dir_v" if vertical else "dir_h",
+                                  self.ICON_COLOR, 19))
         self.btn_dir.setToolTip("切换到横向拼接" if vertical else "切换到竖向拼接")
 
     def set_auto(self, direction: int):
@@ -382,13 +397,18 @@ class LongshotToolbar(QWidget):
                 b.setIcon(icon("stop", "#F53F3F", 18))
                 b.setStyleSheet(self._BTN_RUN_QSS)
             else:
-                b.setIcon(icon(name, "#4E5969", 18))
+                b.setIcon(icon(name, self.ICON_COLOR, 19))
                 b.setStyleSheet(self._BTN_QSS)
 
     def set_size(self, w: int, h: int):
-        self.size_lab.setText(f"{w} × {h}")
-        self.size_lab.adjustSize()   # 尺寸数字变长（如 1911 × 423）时标签伸缩，
-        self.adjustSize()            # 否则会被固定宽度裁掉后半截
+        """只在数字真变时重排：每帧 adjustSize 会让窗口反复改变尺寸，
+        屏幕合成时容易撞到半布局状态（显示成一条灰条）。"""
+        text = f"{w} × {h}"
+        if text == self.size_lab.text():
+            return
+        self.size_lab.setText(text)
+        self.size_lab.adjustSize()
+        self.adjustSize()
 
 
 # ---------------------------------------------------------------- GIF 录制状态条
@@ -764,7 +784,7 @@ class CaptureOverlay(QWidget):
 
         self._hint = QLabel(self)
         self._hint.setStyleSheet(
-            "background:rgba(30,33,41,.82);color:white;border-radius:8px;"
+            "background:rgba(30,33,41,209);color:white;border-radius:8px;"
             "padding:10px 14px;font-size:13px;")
         self._hint.setText(
             "<b>拖拽</b> 框选区域&nbsp;&nbsp;|&nbsp;&nbsp;<b>单击</b> 选中窗口<br/>"
@@ -1227,7 +1247,7 @@ class CaptureOverlay(QWidget):
         ed.setFont(QFont("Microsoft YaHei", 14))
         ed.setLineWrapMode(QTextEdit.NoWrap)
         ed.setStyleSheet(
-            f"QTextEdit{{background:rgba(255,255,255,.94);color:{self._color};"
+            f"QTextEdit{{background:rgba(255,255,255,240);color:{self._color};"
             f"border:1.5px dashed {ACCENT};border-radius:4px;padding:3px 6px;}}")
         if edit_index is not None and self._anns[edit_index].get("rect"):
             ed.move(self._anns[edit_index]["rect"].topLeft())
@@ -1651,14 +1671,7 @@ class CaptureOverlay(QWidget):
         # 长截图期间整个覆盖层镂空，只留选区边框和工具栏：
         # 选区外也恢复实时桌面（不再顶着进入长截图时的暗化快照），
         # 滚动页面时四周不会出现“背景被钉死”的割裂感；框选本身固定不动。
-        ring = QRegion(self._sel.adjusted(-4, -4, 4, 4)) - QRegion(self._sel)
-        # 工具栏是覆盖层子控件，必须把它的区域加回 mask 才不被挖掉；
-        # 只加当前真实显示的那个（普通工具栏在长截图里已隐藏）
-        if self._toolbar is not None and not self._toolbar.isHidden():
-            ring += QRegion(self._toolbar.geometry())
-        if getattr(self, "_ls_bar", None) is not None:
-            ring += QRegion(self._ls_bar.geometry())
-        self.setMask(ring)
+        self._refresh_ls_mask()
         if getattr(self, "_ls_timer", None) is None:
             # PixPin 用 100ms 定时器抓帧（0x14003E7FB / QTimer::start(timer,100)）；
             # 更快只会重复抓到同一画面，白白耗 CPU
@@ -1896,9 +1909,13 @@ class CaptureOverlay(QWidget):
         self._preview = LongshotPreview()
         self._update_preview()
         self._preview.show()
-        # 长截图专用工具栏放选区下方（参照 PixPin：尺寸+方向+上下自动滚+操作）；
-        # 普通截图工具栏隐藏。两者都放洞外，不被 mask 镂空。
+        # 长截图专用工具栏：**独立顶层窗口**。挂在覆盖层下会受覆盖层镂空 mask
+        # 裁切——工具栏宽度随尺寸标签变化，新长出来的按钮会被 mask 切掉
+        # （用户看到「宽度不够、有按钮看不到」正是这个原因）。
         if getattr(self, "_ls_bar", None) is None:
+            # 作为覆盖层的**子控件**：合成由父窗口负责（独立顶层窗口在这套
+            # 全屏镂空覆盖层下会出现只画出部分子控件的现象）。被 mask 裁掉的
+            # 问题由 _refresh_ls_mask() 在尺寸变化时同步解决。
             self._ls_bar = LongshotToolbar(self)
             self._ls_bar.sig_dir.connect(
                 lambda: self._set_ls_dir(
@@ -1911,17 +1928,39 @@ class CaptureOverlay(QWidget):
             self._ls_bar.sig_pin.connect(self._pin_longshot)
         if self._toolbar is not None:
             self._toolbar.hide()
-        bar = self._ls_bar
-        bar.set_dir(getattr(self, "_ls_dir", "v"))
+        self._ls_bar.set_dir(getattr(self, "_ls_dir", "v"))
+        self._place_ls_bar()
+        self._ls_bar.show()
+        self._ls_bar.raise_()
+
+    def _refresh_ls_mask(self):
+        """重建镂空区域：选区只留边框、外加工具栏区域。
+
+        工具栏宽度会随尺寸标签变化，mask 不跟着更新就会把右侧按钮裁掉
+        —— 用户看到「宽度不够、有按钮看不到」正是这个。"""
+        if not getattr(self, "_longshot", False):
+            return
+        ring = QRegion(self._sel.adjusted(-4, -4, 4, 4)) - QRegion(self._sel)
+        bar = getattr(self, "_ls_bar", None)
+        # 用 isHidden() 而不是 isVisible()：父窗口尚未 show 时子控件 isVisible()
+        # 恒为 False，会把工具栏从 mask 里漏掉（自测就抓到这里）
+        if bar is not None and not bar.isHidden():
+            ring += QRegion(bar.geometry())
+        self.setMask(ring)
+
+    def _place_ls_bar(self):
+        """把长截图工具栏摆到选区下方（放不下就上方）——用屏幕坐标，
+        因为它是独立顶层窗口，不跟覆盖层的局部坐标。"""
+        bar = getattr(self, "_ls_bar", None)
+        if bar is None:
+            return
         bar.adjustSize()
         bx = self._sel.x()
         by = self._sel.bottom() + 8
         if by + bar.height() > self.height() - 4:
             by = self._sel.y() - bar.height() - 8
-        bar.move(max(4, min(bx, self.width() - bar.width() - 4)),
-                 max(4, by))
-        bar.show()
-        bar.raise_()
+        bar.move(max(4, min(bx, self.width() - bar.width() - 4)), max(4, by))
+        self._refresh_ls_mask()
 
     def _update_preview(self, force=False):
         """固定比例预览：按真实截图的固定缩放比生成缩略图（宽/高由选区尺寸
@@ -1977,11 +2016,12 @@ class CaptureOverlay(QWidget):
                 p.drawRect(1, int(y0) + 1, pix.width() - 3, max(3, int(y1 - y0) - 2))
                 vp = (int(y0), int(y1))
             p.end()
-        # 只在有拒帧时给一行提示；长宽不再显示（用户要求）
-        note = f"拒 {self._ls_rejected} 帧" if getattr(self, "_ls_rejected", 0) else ""
+        # 状态行不再向用户显示任何调试信息（长宽、拒帧数都不给看）
+        note = ""
         self._preview.set_pix(pix, note, vp)
         if getattr(self, "_ls_bar", None) is not None:
             self._ls_bar.set_size(w, h)
+            self._place_ls_bar()      # 尺寸标签变宽后重新贴合 + 同步镂空区域
         self._place_preview(hdir)
 
     def _place_preview(self, hdir: bool):
@@ -2161,6 +2201,10 @@ class CaptureOverlay(QWidget):
         # 否则覆盖层(WA_DeleteOnClose)销毁后预览窗成孤儿，按钮回调全指向已删除对象
         self._exit_gif()
         self._exit_longshot()
+        # 工具栏有 parent（覆盖层），Qt 会随父对象一起销毁；这里只隐藏，
+        # 再显式 deleteLater 会在父销毁时二次释放（自测退出码 0xC0000409）
+        if getattr(self, "_ls_bar", None) is not None:
+            self._ls_bar.hide()
         if self._toolbar is not None:
             self._toolbar.close()
         super().closeEvent(ev)
