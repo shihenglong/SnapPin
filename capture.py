@@ -156,7 +156,6 @@ class LongshotPreview(QWidget):
         self.setWindowTitle("SnapPin 长截图预览")
         # 透明背景 + 自绘 1px 细边框：面板里不出现任何深色底衬（黑边）
         self.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.setAttribute(Qt.WA_TranslucentBackground, False)
         col = QVBoxLayout(self)
         col.setContentsMargins(2, 2, 2, 2)     # 只给边框留位置，内容贴边
         col.setSpacing(0)
@@ -332,8 +331,10 @@ class LongshotToolbar(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("lsBar")
-        # 背景自己画（见 paintEvent）：QSS 的 border-radius 会把四角留成透明
-        # 露出底下的暗化遮罩，就是用户看到的「漏色」
+        # 与普通截图工具栏完全同款：窗口透明，QSS 的白底不绘制
+        # （CaptureToolbar 也没有 WA_StyledBackground），于是视觉上是
+        # 「透明底 + 每个按钮一块白底 + 整体投影」。
+        self.setAttribute(Qt.WA_TranslucentBackground)
         self._dir = "v"
         row = QHBoxLayout(self)
         row.setContentsMargins(4, 3, 4, 3)
@@ -385,22 +386,16 @@ class LongshotToolbar(QWidget):
         self.btn_up.clicked.connect(lambda: self.sig_auto.emit(-1))
         self.btn_down.clicked.connect(lambda: self.sig_auto.emit(1))
         self.btn_close.clicked.connect(self.sig_close.emit)
-        # 容器背景由 paintEvent 自绘（圆角不透底）；这里只留按钮样式
+        eff = QGraphicsDropShadowEffect(self)
+        eff.setBlurRadius(16)
+        eff.setOffset(0, 2)
+        eff.setColor(QColor(0, 0, 0, 150))
+        self.setGraphicsEffect(eff)
+        # 与普通截图工具栏逐字同款（选择器换成 #lsBar）
         self.setStyleSheet(
+            "#lsBar{background:white;border:1px solid #E3E6EB;border-radius:9px;}"
             "QToolButton{border:none;border-radius:7px;padding:2px;background:white;}"
             "QToolButton:hover{background:#F2F3F5;}")
-
-    def paintEvent(self, _):
-        """自绘白底圆角 + 1px 描边。
-
-        用 QSS 的 border-radius 会把四个角留成透明（露出覆盖层的暗化遮罩），
-        看起来像「漏色」；自绘圆角矩形才真正铺满。"""
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing, True)
-        p.setPen(QPen(QColor("#D5DAE2"), 1))
-        p.setBrush(QColor("#FFFFFF"))
-        p.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 9, 9)
-        p.end()
 
     def _sep(self):
         w = QWidget(self)
