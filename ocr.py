@@ -135,6 +135,20 @@ class OcrRunner(QObject):
             self._pipes[self._lang] = pipe
         return pipe
 
+    def warmup(self):
+        """预热：把当前语种的 ONNX session 与字典先加载好（首次约 1~2 秒），
+        避免用户钉图后第一次取字等两秒。"""
+        pipe = self._pipeline()
+        if pipe is None:
+            return False
+        try:
+            pipe.bank.session(pipe.det_name)
+            pipe.bank.session(pipe.rec_name)
+            pipe._chars()
+        except Exception:
+            return False
+        return True
+
     def _run_engine(self, pixmap):
         try:
             img = _pixmap_to_bgr(pixmap)

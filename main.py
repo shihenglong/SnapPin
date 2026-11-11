@@ -160,14 +160,22 @@ class App:
 
     @staticmethod
     def _warm_modules():
-        """后台线程预 import 截图/贴图模块（numpy 等大依赖），
-        首次按热键时只剩抓屏一步同步开销。"""
+        """后台线程预 import 截图/贴图模块（numpy 等大依赖），并预热 OCR 模型。
+
+        首次按热键时只剩抓屏一步同步开销；OCR 的 ONNX session 加载要 1~2 秒，
+        放在这里预热后，用户钉图取字不用再等。"""
         def _do():
             for name in ("capture", "pinwin"):
                 try:
                     __import__(name)
                 except Exception:
                     pass
+            try:
+                import ocr as _ocr
+                if _ocr.available():
+                    _ocr.OcrRunner().warmup()
+            except Exception:
+                pass
         threading.Thread(target=_do, daemon=True, name="snappin-warmup").start()
 
     # ------------------------------------------------ 托盘

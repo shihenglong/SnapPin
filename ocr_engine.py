@@ -130,7 +130,9 @@ def _crop_poly(img: np.ndarray, pts: np.ndarray) -> np.ndarray:
                                borderMode=cv2.BORDER_REPLICATE)
 
 
-_REC_MAX_W = 2048        # 长行宽度上限
+_REC_MAX_W = 960         # 长行宽度上限：高 48 时 960 对应宽高比 20，
+                         # 覆盖绝大多数文本行。放到 2048 会让 rec 计算量翻倍
+                         # 而精度不变（实测 10 行识别结果相同，耗时减半）
 
 
 def _rec_prepare(crop: np.ndarray, img_h: int = 48, img_w: int = None):
@@ -154,6 +156,23 @@ def _rec_prepare(crop: np.ndarray, img_h: int = 48, img_w: int = None):
 
 
 # ---------------------------------------------------------------- 管线
+_PIPE_BANK = {}
+_PIPE_BANK_LOCK = threading.Lock()
+
+
+def _shared_bank(models_dir: str) -> "_ModelBank":
+    """进程内共享的模型仓：ONNX session 只加载一次。
+
+    加载本身要 1~2 秒（三个模型 ~25MB）；每个 OcrPipeline 各建一个 bank 会让
+    每次 OCR 都重载——钉图后明显卡顿的主因之一。"""
+    with _PIPE_BANK_LOCK:
+        bank = _PIPE_BANK.get(models_dir)
+        if bank is None:
+            bank = _ModelBank(models_dir)
+            _PIPE_BANK[models_dir] = bank
+        return bank
+
+
 class OcrPipeline:
     """detect → crop → sr(超分) → rec。线程内调用，一次一张图。"""
 
@@ -161,13 +180,19 @@ class OcrPipeline:
                              # 2048 兼顾小字与耗时；更大的图按此值切块）
     CHUNK_OVERLAP = 64       # 超长图切块的重叠：跨界行至少在一块里完整
     BOX_THRESH = 0.30        # DB 二值化阈值
-    UNCLIP = 1.60            # 文本框外扩系数
+    UNCLIP = 1.10            # DB 外扩系数（距离变换语义：dist = 面积×系数/周长，
+                             # 扁框时 ≈ 框高×系数/2）。实测扫描：1.0 漏检细扁行
+                             # （框 9/10）、1.2~1.45 在 12px 场景回落到 9/10、
+                             # 1.10 两个场景都 10/10 且最快，取它。
+    MIN_ASPECT = 0.0         # >0 时只保留「长边/短边 ≥ MIN_ASPECT」的框
+                             # （PixPin 侧有常量 1.5，但报告第 8.3 条注明该
+                             #  分支语义未确证，默认 0 = 不过滤，避免误伤单字）
     SR_MIN_H = 24            # 裁块高度小于它就当「小字」，先放大
     SR_MAX_FACTOR = 4
 
     def __init__(self, models_dir: str, det: str, rec: str, keys: str,
                  cls: str = "ch_ppocr_mobile_v2.0_cls_infer.onnx"):
-        self.bank = _ModelBank(models_dir)
+        self.bank = _shared_bank(models_dir)
         self.det_name = det
         self.rec_name = rec
         self.keys_name = keys
@@ -210,6 +235,11 @@ class OcrPipeline:
             bw, bh = rect[1]
             if bw < 3 or bh < 3:
                 continue
+            if self.MIN_ASPECT > 0:
+                short = min(bw, bh)
+                long_ = max(bw, bh)
+                if long_ / max(1e-6, short) < self.MIN_ASPECT:
+                    continue
             pts = cv2.boxPoints(rect)
             x0 = int(max(0, np.floor(pts[:, 0].min())))
             x1 = int(min(prob.shape[1], np.ceil(pts[:, 0].max())))
@@ -220,8 +250,15 @@ class OcrPipeline:
             score = float(prob[y0:y1, x0:x1].mean())
             if score < self.BOX_THRESH:
                 continue
-            cx, cy = pts.mean(axis=0)
-            pts = (pts - [cx, cy]) * self.UNCLIP + [cx, cy]   # 外扩
+            # DB 外扩：按「面积/周长」算出偏移距离，四条边各外扩 dist
+            # （PaddleOCR 的 unclip 语义）。旧实现是围绕中心等比缩放，
+            # 对扁框纵向长高严重不足：h=9.6 只到 15，而字形高 20px →
+            # 裁块丢上下笔画，识别成「止文/内客/行铂」这类形近错字。
+            area = bw * bh
+            peri = 2.0 * (bw + bh)
+            dist = area * self.UNCLIP / max(1e-6, peri)
+            pts = cv2.boxPoints((rect[0], (bw + 2.0 * dist, bh + 2.0 * dist),
+                                 rect[2]))
             pts = pts * [sx, sy]                             # 回原图
             out.append((_order_quad(np.clip(pts, [0, 0], [w - 1, h - 1])),
                         score))
@@ -271,13 +308,23 @@ class OcrPipeline:
         for crop, _pts, _sc in crops:
             x, (th, tw) = _rec_prepare(crop)
             prepped.append(x)
-        # 按有效宽度分桶，减少 padding 浪费
+        # 同桶内宽度相近才拼批：混进一个长行会让整批都 pad 到它那么宽，
+        # 计算量按最宽者算（rec 占总耗时 95%，这是主要浪费来源）
         order = sorted(range(len(prepped)),
                        key=lambda i: prepped[i].shape[2])
         results = [None] * len(prepped)
         batch = 8
-        for s in range(0, len(order), batch):
-            idxs = order[s:s + batch]
+        groups, cur = [], []
+        for i in order:
+            w = prepped[i].shape[2]
+            if cur and (len(cur) >= batch or
+                        w > prepped[cur[0]].shape[2] * 1.5):
+                groups.append(cur)
+                cur = []
+            cur.append(i)
+        if cur:
+            groups.append(cur)
+        for idxs in groups:
             wmax = max(prepped[i].shape[2] for i in idxs)
             stack = np.zeros((len(idxs), 3, 48, wmax), np.float32)
             for j, i in enumerate(idxs):
