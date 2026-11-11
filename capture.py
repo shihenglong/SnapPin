@@ -143,20 +143,21 @@ class LongshotPreview(QWidget):
     滚动跟随当前视口，绿框标出视口段。鼠标移上去时整窗变淡并**点击穿透**
     ——面板常盖住滚动条，不穿透就没法拖着滚（用户明确要求）。"""
 
-    V_W = 192                    # 竖向面板宽度（内容 180 + 左右边距 12）
-    CAP_V_W = 180                # 竖向目标内容宽（缩放基准）
-    CAP_H_H = 172                # 横向目标内容高（缩放基准）
+    V_W = 204                    # 竖向面板宽度（内容 200 + 边框/边距 4）
+    CAP_V_W = 200                # 竖向目标内容宽（缩放基准）
+    CAP_H_H = 200                # 横向目标内容高（缩放基准）
     HOVER_OPACITY = 0.22         # 悬停时的不透明度
-    PAD = 11                     # 上下边距合计（contentsMargins 6+5）
+    PAD = 4                      # 上下边距合计（contentsMargins 2+2）
 
     def __init__(self):
         super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setWindowTitle("SnapPin 长截图预览")
-        self.setAttribute(Qt.WA_StyledBackground, True)
+        # 透明背景 + 自绘 1px 细边框：面板里不出现任何深色底衬（黑边）
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WA_TranslucentBackground, False)
         col = QVBoxLayout(self)
-        col.setContentsMargins(6, 6, 6, 5)
-        col.setSpacing(4)
+        col.setContentsMargins(2, 2, 2, 2)     # 只给边框留位置，内容贴边
+        col.setSpacing(0)
         self.scroll = QScrollArea(self)
         self.scroll.setWidgetResizable(False)
         self.scroll.setFocusPolicy(Qt.NoFocus)
@@ -164,11 +165,11 @@ class LongshotPreview(QWidget):
         # 滚动条只作程序控制（跟随视口），不显示给用户
         self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.scroll.setStyleSheet("QScrollArea{background:#0E1116;border-radius:8px;}")
+        self.scroll.setStyleSheet("QScrollArea{background:transparent;border:none;}")
         self.lab = QLabel()
         self.lab.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.lab.setStyleSheet(
-            "background:#0E1116;color:#7C8595;font-size:11px;padding:8px;")
+            "background:transparent;color:#7C8595;font-size:11px;")
         self.lab.setText("滚动页面\n开始拼接")
         self.lab.resize(160, 200)
         self.scroll.setWidget(self.lab)
@@ -178,15 +179,7 @@ class LongshotPreview(QWidget):
         self.status.setStyleSheet(
             "color:#7C8595;font-size:10px;background:transparent;padding-top:1px;")
         col.addWidget(self.status)
-        self.setStyleSheet(
-            "LongshotPreview{background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
-            "stop:0 #1C2230,stop:1 #12161D);"
-            "border:1px solid rgba(46,124,246,107);border-radius:12px;}")
-        eff = QGraphicsDropShadowEffect(self)
-        eff.setBlurRadius(24)
-        eff.setOffset(0, 5)
-        eff.setColor(QColor(0, 0, 0, 120))
-        self.setGraphicsEffect(eff)
+        # 无背景：内容直接显示，外圈只有 1px 细边框（paintEvent 画）
         self._hdir = False
         self._frozen = False
         self._scale = 0.25
@@ -260,7 +253,7 @@ class LongshotPreview(QWidget):
         scr = self.screen() or QApplication.primaryScreen()
         g = scr.availableGeometry() if scr else None
         if self._hdir:
-            w = min(pix.width() + 12, (g.width() - 60) if g else pix.width() + 12)
+            w = min(pix.width() + self.PAD, (g.width() - 60) if g else pix.width() + self.PAD)
             self.setFixedSize(max(120, w), pix.height() + self.PAD)
         else:
             h = min(pix.height() + self.PAD,
@@ -285,6 +278,15 @@ class LongshotPreview(QWidget):
         if getattr(self, "_hover_timer", None) is not None:
             self._hover_timer.stop()
         super().closeEvent(ev)
+
+    def paintEvent(self, _):
+        """只画 1px 细边框，不铺任何底色——面板贴在网页上时不出黑边。"""
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(QPen(QColor(180, 188, 200, 200), 1))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 7, 7)
+        p.end()
 
     def clear(self):
         self.lab.clear()
@@ -318,9 +320,8 @@ class LongshotToolbar(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("lsBar")
-        # QWidget 子类默认不绘制 QSS 的 background，必须打开这个属性，
-        # 否则深色卡片永远画不出来（白底会与白色网页融为一体）
-        self.setAttribute(Qt.WA_StyledBackground, True)
+        # 背景自己画（见 paintEvent）：QSS 的 border-radius 会把四角留成透明
+        # 露出底下的暗化遮罩，就是用户看到的「漏色」
         self._dir = "v"
         row = QHBoxLayout(self)
         row.setContentsMargins(4, 3, 4, 3)
@@ -372,14 +373,22 @@ class LongshotToolbar(QWidget):
         self.btn_up.clicked.connect(lambda: self.sig_auto.emit(-1))
         self.btn_down.clicked.connect(lambda: self.sig_auto.emit(1))
         self.btn_close.clicked.connect(self.sig_close.emit)
-        # 不用 QGraphicsDropShadowEffect：作用在**顶层窗口**上会让 Qt 走离屏
-        # 渲染，实测只画出部分子控件（屏幕上只剩一条灰条）。用更明显的描边
-        # 代替阴影，保证在白色网页上也看得出边界。
-        # 与普通截图工具栏同一套：白色圆角胶囊 + 浅描边 + 图标按钮 hover 提亮
+        # 容器背景由 paintEvent 自绘（圆角不透底）；这里只留按钮样式
         self.setStyleSheet(
-            "#lsBar{background:white;border:1px solid #D5DAE2;border-radius:9px;}"
             "QToolButton{border:none;border-radius:7px;padding:2px;background:white;}"
             "QToolButton:hover{background:#F2F3F5;}")
+
+    def paintEvent(self, _):
+        """自绘白底圆角 + 1px 描边。
+
+        用 QSS 的 border-radius 会把四个角留成透明（露出覆盖层的暗化遮罩），
+        看起来像「漏色」；自绘圆角矩形才真正铺满。"""
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(QPen(QColor("#D5DAE2"), 1))
+        p.setBrush(QColor("#FFFFFF"))
+        p.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 9, 9)
+        p.end()
 
     def _sep(self):
         w = QWidget(self)
@@ -388,10 +397,11 @@ class LongshotToolbar(QWidget):
         return w
 
     def set_dir(self, d: str):
+        """按钮图标表示**点击后会切到的方向**（用户反馈：原来反了）。"""
         self._dir = d
         vertical = d == "v"
-        self.btn_dir.setIcon(icon("dir_v" if vertical else "dir_h",
-                                  self.ICON_COLOR, 19))
+        self.btn_dir.setIcon(icon("dir_h" if vertical else "dir_v",
+                                  self.ICON_COLOR, 20, 1.6))
         self.btn_dir.setToolTip("切换到横向拼接" if vertical else "切换到竖向拼接")
 
     def set_auto(self, direction: int):
