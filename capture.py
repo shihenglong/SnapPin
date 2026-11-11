@@ -303,6 +303,11 @@ class LongshotPreview(QWidget):
         self.lab.setText("滚动页面\n开始拼接")
         self.status.hide()
 
+    def placeholder_off(self):
+        """拼接开始后清掉占位提示：预览窗若与选区重叠（全宽选区回弹），
+        占位文字会被抓帧拼进长图（用户实测）。"""
+        self.lab.setText("")
+
 
 # ---------------------------------------------------------------- 长截图工具栏
 class LongshotToolbar(QWidget):
@@ -1395,7 +1400,7 @@ class CaptureOverlay(QWidget):
         pts = ann.get("pts", [])
         color = QColor(ann.get("color", self._color))
         p.setRenderHint(QPainter.Antialiasing, True)
-        if tool in ("pen", "marker", "mosaic", "line") and len(pts) >= 2:
+        if tool in ("pen", "marker", "mosaic") and len(pts) >= 2:
             pen = QPen()
             if tool == "pen":
                 pen = QPen(color, 3)
@@ -1403,18 +1408,19 @@ class CaptureOverlay(QWidget):
                 c = QColor(color)
                 c.setAlpha(110)
                 pen = QPen(c, 14)
-            elif tool == "mosaic":
-                pen = QPen(QBrush(self.mosaic_img), 18)
             else:
-                pen = QPen(color, 3)
+                pen = QPen(QBrush(self.mosaic_img), 18)
             pen.setCapStyle(Qt.RoundCap)
             pen.setJoinStyle(Qt.RoundJoin)
             p.setPen(pen)
             p.setBrush(Qt.NoBrush)
             p.drawPolyline(pts)
-            if tool == "line":
-                return
         if tool in ("pen", "marker", "mosaic"):
+            return
+        if tool == "line" and len(pts) >= 2:
+            # 真直线：只取首尾两点（旧实现走拖拽轨迹点列，与手绘无异）
+            p.setPen(QPen(color, 3, Qt.SolidLine, Qt.RoundCap))
+            p.drawLine(pts[0], pts[-1])
             return
         if tool == "rect":
             p.setPen(QPen(color, 3))
@@ -1425,8 +1431,8 @@ class CaptureOverlay(QWidget):
             p.setBrush(Qt.NoBrush)
             p.drawEllipse(QRect(pts[0], pts[-1]).normalized())
         elif tool == "arrow" and len(pts) >= 2:
-            p.setPen(QPen(color, 3))
-            p.drawPolyline(pts)
+            p.setPen(QPen(color, 3, Qt.SolidLine, Qt.RoundCap))
+            p.drawLine(pts[0], pts[-1])       # 箭杆也是真直线
             a, b = pts[0], pts[-1]
             ang = math.atan2(b.y() - a.y(), b.x() - a.x())
             L = 14
@@ -1871,6 +1877,8 @@ class CaptureOverlay(QWidget):
                          else np.ascontiguousarray(np.rot90(frame, k=-1)))
         self._ls_view = 0
         self._ls_miss = 0
+        if self._preview is not None:
+            self._preview.placeholder_off()
         self._update_preview(force=True)
 
     def _grab_region(self):
@@ -2104,11 +2112,27 @@ class CaptureOverlay(QWidget):
                 y = max(4, self._sel.y() - self._preview.height() - 8)
             x = max(4, min(x, self.width() - self._preview.width() - 4))
         else:
-            x = self._sel.right() + 16
-            if x + self._preview.width() > self.width() - 4:
-                x = max(4, self._sel.left() - self._preview.width() - 16)
-            y = self._sel.y() + max(0, (self._sel.height() - self._preview.height()) // 2)
-            y = max(4, min(y, self.height() - self._preview.height() - 4))
+            # 竖向：右侧 → 左侧 → 选区下方 → 选区上方 → 贴边。
+            # 全宽选区两侧都放不下时，压进选区的窗口会被抓帧拼进长图
+            # （用户实测「滚动页面/开始拼接」占位文字出现在长图右缘）。
+            w_pv, h_pv = self._preview.width(), self._preview.height()
+            y_mid = self._sel.y() + max(0, (self._sel.height() - h_pv) // 2)
+            if self._sel.right() + 16 + w_pv <= self.width() - 4:
+                x = self._sel.right() + 16
+                y = y_mid
+            elif self._sel.left() - w_pv - 16 >= 4:
+                x = self._sel.left() - w_pv - 16
+                y = y_mid
+            else:
+                x = max(4, min(self._sel.x()
+                               + max(0, (self._sel.width() - w_pv) // 2),
+                               self.width() - w_pv - 4))
+                if self._sel.bottom() + 8 + h_pv <= self.height() - 4:
+                    y = self._sel.bottom() + 8
+                else:
+                    y = max(4, self._sel.y() - h_pv - 8)
+            y = max(4, min(y, self.height() - h_pv - 4))
+            x = max(4, x)
         self._preview.move(x, y)
 
     def _longshot_pixmap(self) -> QPixmap:

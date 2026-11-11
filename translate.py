@@ -52,6 +52,11 @@ _CODE_TOKEN = re.compile(
 )
 _PLACEHOLDER = re.compile(r"zz(\d{1,3})zz")
 
+# 英文句子结构判别：常见停用词（前后加空格做整词匹配）
+_EN_STOP = (" the ", " and ", " of ", " to ", " a ", " in ", " is ", " are ",
+            " for ", " with ", " on ", " when ", " that ", " this ", " how ",
+            " can ", " be ", " it ")
+
 
 def _protect_codes(texts):
     """texts → (受保护文本列表, 每条的 token 表)。"""
@@ -75,6 +80,32 @@ def _restore_codes(line: str, toks: list[str]) -> str:
         return toks[i] if i < len(toks) else m.group(0)
 
     return _PLACEHOLDER.sub(_sub, line)
+
+
+def _needs_mt(line: str, n_toks: int = 0) -> bool:
+    """行级语言分流：en→zh 模型把中文输入整句编成 unk（输出
+    「2025/1997/29*, ⁇ ⁇ ⁇」式乱码，用户实测截图）。
+
+    送翻需同时满足：
+    - 拉丁字母占主导（CJK 不足一半）——中文行原样保留
+    - 非「代码块」：抽出的 token ≥ 2 且全行无中文时是 CSS/代码段，不翻
+      （技术代码原样保留才是正确行为）
+    - 有英文句子结构：常见停用词（the/and/of/…）出现，区分英文句子与
+      无语义的标识符串"""
+    if not line.strip():
+        return False
+    letters = [ch for ch in line if ch.isalpha()]
+    if not letters:
+        return False                       # 纯数字/符号：无需翻译
+    cjk = sum(1 for ch in letters
+              if "\u2e80" <= ch <= "\u9fff" or "\u3400" <= ch <= "\u4dbf")
+    if cjk * 2 >= len(letters):
+        return False                       # 中文主导：原样保留
+    if n_toks >= 2 and cjk == 0:
+        return False                       # 多 token 零中文：代码块
+    low = " " + line.lower() + " "
+    stop = sum(low.count(w) for w in _EN_STOP)
+    return stop >= 2 or (stop >= 1 and n_toks <= 1)
 
 
 _OLLAMA_HOST = "http://localhost:11434"
@@ -472,16 +503,26 @@ class TranslateClient(QObject):
 
     # ------------------------------------------------ 离线插件（Bergamot，QProcess 文件 IPC）
     def _local_translate(self, texts: list, target: str, tag: int, merge=None):
-        """merge=(base_results, indices)：只把结果写回指定下标后整体发出。"""
+        """merge=(base_results, indices)：只把结果写回指定下标后整体发出。
+
+        行级分流：中文为主的行不送 en→zh 模型（整句 unk 乱码），原样保留，
+        英文代码词已由占位保护原样呈现——正合「中文页面里翻掉英文残留」
+        的预期；拉丁字母主导的行才真正送翻。"""
         to = _LOCAL_LANG.get((target or "zh-CN").lower(), "zh")
         prot = _protect_codes(texts)
+        send = [i for i, (t, toks) in enumerate(prot) if _needs_mt(t, len(toks))]
+        if not send:
+            self.last_engine = "离线（无英文内容行）"
+            self.done.emit(list(texts), tag)
+            return
         fd_in, path_in = tempfile.mkstemp(suffix=".txt", prefix="snappin_tr_")
         fd_out, path_out = tempfile.mkstemp(suffix=".txt", prefix="snappin_tr_")
         os.close(fd_in)
         os.close(fd_out)
         try:
             with open(path_in, "w", encoding="utf-8") as f:
-                f.write("\n".join(t.replace("\n", " ") for t, _ in prot))
+                f.write("\n".join(prot[i][0].replace("\n", " ")
+                                  for i in send))
         except OSError:
             self.failed.emit("离线插件输入文件写入失败", tag)
             return
@@ -512,12 +553,14 @@ class TranslateClient(QObject):
                 self.failed.emit("离线翻译插件执行失败", t)
                 return
             lines = out.splitlines()
-            lines = [ln.strip() for ln in lines][:n]
-            while len(lines) < n:                     # 引擎少数行 → 原文兜底
-                lines.append(texts[len(lines)])
-            # 占位还原：engine 少数行兜底的那几条本来就是原文，还原是无操作
-            for i in range(min(len(lines), n)):
-                lines[i] = _restore_codes(lines[i], prot[i][1])
+            lines = [ln.strip() for ln in lines][:len(send)]
+            while len(lines) < len(send):             # 引擎少数行 → 原文兜底
+                lines.append(prot[send[len(lines)]][0])
+            # 占位还原 + 展开回全量（未送翻的中文行原样保留）
+            full = list(texts)
+            for j, i in enumerate(send):
+                full[i] = _restore_codes(lines[j], prot[i][1])
+            lines = full
             if m is not None:                         # 在线直连的缺口补齐模式
                 base, indices = m
                 for j, idx in enumerate(indices):
@@ -526,7 +569,7 @@ class TranslateClient(QObject):
                 self.last_engine = "在线直连+词典兜底"
                 self.done.emit(base, t)
             else:
-                self.last_engine = "离线词典兜底"
+                self.last_engine = "离线（Bergamot）"
                 self.done.emit(lines, t)
 
         proc.finished.connect(_fin)
