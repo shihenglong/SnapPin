@@ -138,20 +138,22 @@ class CaptureToolbar(QWidget):
 
 # ---------------------------------------------------------------- 长截图预览窗
 class LongshotPreview(QWidget):
-    """长截图侧边预览（参照 PixPin，用户明确要求）：
-    窗口尺寸首次打开即固定；预览图按真实截图**固定比例**缩小（等比、不随长度
-    变比例），滚动增长时图像沿拼接方向**直接延伸**，面板内自动滚动跟随当前
-    视口位置，绿色框标出视口所在的段。竖向=选区右侧垂直居中，横向=工具栏正下方。"""
+    """长截图侧边预览（参照 PixPin）：
+    首次打开按**选区比例**定缩放比，内容增长时沿拼接方向延伸；面板内自动
+    滚动跟随当前视口，绿框标出视口段。鼠标移上去时整窗变淡并**点击穿透**
+    ——面板常盖住滚动条，不穿透就没法拖着滚（用户明确要求）。"""
 
-    V_W, V_H = 132, 560          # 竖向面板固定尺寸
-    H_W, H_H = 560, 170          # 横向面板固定尺寸
+    V_W = 200                    # 竖向面板宽度（原 132 太窄，缩略图看不清）
+    H_H = 232                    # 横向面板高度（原 170）
+    HOVER_OPACITY = 0.22         # 悬停时的不透明度
 
     def __init__(self):
         super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setWindowTitle("SnapPin 长截图预览")
+        self.setAttribute(Qt.WA_TranslucentBackground, False)
         col = QVBoxLayout(self)
-        col.setContentsMargins(5, 5, 5, 4)
-        col.setSpacing(3)
+        col.setContentsMargins(6, 6, 6, 5)
+        col.setSpacing(4)
         self.scroll = QScrollArea(self)
         self.scroll.setWidgetResizable(False)
         self.scroll.setFocusPolicy(Qt.NoFocus)
@@ -159,35 +161,79 @@ class LongshotPreview(QWidget):
         # 滚动条只作程序控制（跟随视口），不显示给用户
         self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.scroll.setStyleSheet("QScrollArea{background:#16191E;border-radius:6px;}")
+        self.scroll.setStyleSheet("QScrollArea{background:#0E1116;border-radius:8px;}")
         self.lab = QLabel()
         self.lab.setAlignment(Qt.AlignLeft | Qt.AlignTop)
-        self.lab.setStyleSheet("background:#16191E;color:#9AA0AC;font-size:11px;")
+        self.lab.setStyleSheet(
+            "background:#0E1116;color:#7C8595;font-size:11px;padding:8px;")
         self.lab.setText("滚动页面\n开始拼接")
-        self.lab.resize(120, 200)
+        self.lab.resize(160, 200)
         self.scroll.setWidget(self.lab)
         col.addWidget(self.scroll, 1)
         self.status = QLabel("")
         self.status.setAlignment(Qt.AlignHCenter)
-        self.status.setStyleSheet("color:#8A9099;font-size:10px;background:transparent;")
+        self.status.setStyleSheet(
+            "color:#7C8595;font-size:10px;background:transparent;padding-top:1px;")
         col.addWidget(self.status)
         self.setStyleSheet(
-            "LongshotPreview{background:#16191E;border:2px solid #2E7CF6;"
-            "border-radius:9px;}")
+            "LongshotPreview{background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+            "stop:0 #1C2230,stop:1 #12161D);"
+            "border:1px solid rgba(46,124,246,0.42);border-radius:12px;}")
+        eff = QGraphicsDropShadowEffect(self)
+        eff.setBlurRadius(24)
+        eff.setOffset(0, 5)
+        eff.setColor(QColor(0, 0, 0, 120))
+        self.setGraphicsEffect(eff)
         self._hdir = False
         self._frozen = False
         self._scale = 0.25
-        self.setFixedSize(self.V_W, 150)
+        self._hovered = False
+        self.setFixedSize(self.V_W, 180)
+        # 悬停轮询：一旦设成点击穿透就收不到 leaveEvent，只能用光标位置判断
+        self._hover_timer = QTimer(self, interval=90)
+        self._hover_timer.timeout.connect(self._check_hover)
+        self._hover_timer.start()
+
+    # ---------------------------------------------------------- 悬停穿透
+    def _check_hover(self):
+        if not self.isVisible():
+            return
+        inside = self.frameGeometry().contains(QCursor.pos())
+        if inside == self._hovered:
+            return
+        self._hovered = inside
+        self.setWindowOpacity(self.HOVER_OPACITY if inside else 1.0)
+        self._set_click_through(inside)
+
+    def _set_click_through(self, on: bool):
+        """切 WS_EX_TRANSPARENT：预览窗盖住滚动条时，点击/滚轮落到下面窗口。"""
+        try:
+            hwnd = wintypes.HWND(int(self.winId()))
+            user32.GetWindowLongW.restype = ctypes.c_long
+            user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+            user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int,
+                                              ctypes.c_long]
+            GWL_EXSTYLE = -20
+            WS_EX_TRANSPARENT = 0x00000020
+            ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            new = (ex | WS_EX_TRANSPARENT) if on else (ex & ~WS_EX_TRANSPARENT)
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new)
+        except Exception:
+            pass
 
     def freeze(self, hdir: bool, sel_w: int, sel_h: int):
-        """首次打开时只确定**缩放比**（按选区尺寸等比铺满面板宽度/高度）；
-        窗口的长/宽不固定——随内容增长沿拼接方向延伸（用户明确要求），
-        超过屏幕可用区后窗口停住、内部滚动跟随当前视口。"""
+        """首次打开只确定**缩放比**：按选区尺寸等比铺满面板的跨轴。
+
+        缩放比一经确定不再变（内容只沿拼接方向延伸），保证长图不被压扁。"""
         if self._frozen:
             return
         self._hdir = hdir
-        # 竖向把选区宽缩到面板内宽 120；横向把选区高缩到 118
-        self._scale = (118.0 / max(1, sel_h)) if hdir else (120.0 / max(1, sel_w))
+        if hdir:
+            # 横向：选区高度映射到面板内高，宽度随内容延伸
+            self._scale = (self.H_H - 60) / max(1, sel_h)
+        else:
+            # 竖向：选区宽度映射到面板内宽，高度随内容延伸
+            self._scale = (self.V_W - 20) / max(1, sel_w)
         self._frozen = True
 
     def unfreeze(self):
@@ -209,21 +255,18 @@ class LongshotPreview(QWidget):
         # 窗口长/宽不固定：随内容延伸，夹在屏幕可用区内（超出后内部滚动）
         scr = self.screen() or QApplication.primaryScreen()
         g = scr.availableGeometry() if scr else None
-        # 窗口精确贴合内容（图像 + 状态行），不留大块黑边：竖向高度 = 图高
-        # + 28（边距/间距/状态行），横向宽度 = 图宽 + 16。仅夹在屏幕可用区内。
         if self._hdir:
-            w = min(pix.width() + 16, (g.width() - 60) if g else pix.width() + 16)
-            self.setFixedSize(max(90, w), self.H_H)
+            w = min(pix.width() + 22, (g.width() - 60) if g else pix.width() + 22)
+            self.setFixedSize(max(120, w), self.H_H)
         else:
-            h = min(pix.height() + 28, (g.height() - 90) if g else pix.height() + 28)
-            self.setFixedSize(self.V_W, max(60, h))
+            h = min(pix.height() + 34, (g.height() - 90) if g else pix.height() + 34)
+            self.setFixedSize(self.V_W, max(90, h))
         sb = (self.scroll.horizontalScrollBar() if self._hdir
               else self.scroll.verticalScrollBar())
         span = (self.scroll.viewport().width() if self._hdir
                 else self.scroll.viewport().height())
         if vp and vp[1] > vp[0]:
-            # 视口框始终贴在预览**底部**（用户要求：向下滚动时当前区域
-            # 永远可见在最下边；向上滚动时框也仍在可见区内）
+            # 视口框始终贴在预览**底部**（向下滚动时当前区域永远可见）
             sb.setValue(max(0, min(sb.maximum(), int(vp[1] - span))))
         if note:
             self.status.setText(note)
@@ -239,8 +282,8 @@ class LongshotPreview(QWidget):
 
 # ---------------------------------------------------------------- 长截图工具栏
 class LongshotToolbar(QWidget):
-    """长截图模式选区下方的专用工具栏（参照 PixPin）：
-    [宽 × 高] | [⇕ 竖/横] [↑ 向上自动滚] [↓ 向下自动滚] | [✕][保存][复制][完成]"""
+    """长截图专用工具栏（全图标，与普通截图工具栏同一套 SVG）：
+    [宽 × 高] | [钉图][保存][复制][完成] | [方向][↑][↓] | [✕]"""
 
     sig_dir = Signal()
     sig_auto = Signal(int)      # +1 向下自动滚 / -1 向上自动滚（重复点击=停止）
@@ -248,100 +291,99 @@ class LongshotToolbar(QWidget):
     sig_save = Signal()
     sig_copy = Signal()
     sig_finish = Signal()
+    sig_pin = Signal()
+
+    _BTN_QSS = ("QToolButton{border:none;border-radius:7px;background:transparent;}"
+                "QToolButton:hover{background:#F0F2F5;}"
+                "QToolButton:pressed{background:#E4E7EC;}")
+    _BTN_RUN_QSS = ("QToolButton{border:none;border-radius:7px;background:#FDECEC;}"
+                    "QToolButton:hover{background:#FBDDDD;}")
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("lsBar")
         self._dir = "v"
         row = QHBoxLayout(self)
-        row.setContentsMargins(8, 3, 5, 3)
-        row.setSpacing(4)
+        row.setContentsMargins(8, 5, 7, 5)
+        row.setSpacing(5)
         self.size_lab = QLabel("0 × 0")
         self.size_lab.setStyleSheet(
             "background:#F2F3F5;color:#4E5969;border-radius:6px;"
             "padding:3px 8px;font-size:12px;font-weight:600;")
         row.addWidget(self.size_lab)
-        line = QWidget()
-        line.setFixedSize(1, 18)
-        line.setStyleSheet("background:#E5E6EB;")
-        row.addWidget(line)
+        row.addWidget(self._sep())
 
-        def pill(b):
-            b.setFixedSize(28, 26)
+        def ibtn(name, tip, color="#4E5969"):
+            b = QToolButton(self)
+            b.setIcon(icon(name, color, 19))
+            b.setIconSize(QSize(19, 19))
+            b.setFixedSize(32, 30)
             b.setCursor(Qt.PointingHandCursor)
             b.setFocusPolicy(Qt.NoFocus)
-            b.setStyleSheet(
-                "QPushButton{border:none;border-radius:6px;background:white;"
-                "font-size:12px;color:#4E5969;}"
-                "QPushButton:hover{background:#F2F3F5;}")
+            b.setToolTip(tip)
+            b.setStyleSheet(self._BTN_QSS)
             return b
 
-        self.btn_dir = pill(QPushButton("⇕ 竖向"))
-        self.btn_dir.setFixedWidth(64)
-        self.btn_dir.setToolTip("切换竖向/横向拼接")
-        self.btn_up = pill(QPushButton("↑"))
-        self.btn_up.setToolTip("自动向上滚动拼接")
-        self.btn_down = pill(QPushButton("↓"))
-        self.btn_down.setToolTip("自动向下滚动拼接")
+        self.btn_pin = ibtn("pin", "钉到桌面")
+        self.btn_save = ibtn("save", "保存为图片")
+        self.btn_copy = ibtn("copy", "复制到剪贴板")
+        self.btn_ok = ibtn("check", "完成并复制 (Enter)", "#FFFFFF")
+        self.btn_ok.setStyleSheet(
+            "QToolButton{border:none;border-radius:7px;background:#2E7CF6;}"
+            "QToolButton:hover{background:#1E66E0;}"
+            "QToolButton:pressed{background:#1A58C4;}")
+        for b in (self.btn_pin, self.btn_save, self.btn_copy, self.btn_ok):
+            row.addWidget(b)
+        row.addWidget(self._sep())
+        self.btn_dir = ibtn("dir_v", "切换到横向拼接")
+        self.btn_up = ibtn("auto_up", "自动向上滚动拼接")
+        self.btn_down = ibtn("auto_down", "自动向下滚动拼接")
         for b in (self.btn_dir, self.btn_up, self.btn_down):
             row.addWidget(b)
-        line2 = QWidget()
-        line2.setFixedSize(1, 18)
-        line2.setStyleSheet("background:#E5E6EB;")
-        row.addWidget(line2)
-        self.btn_close = pill(QPushButton("✕"))
-        self.btn_close.setToolTip("取消长截图 (Esc)")
-        self.btn_save = pill(QPushButton("保存"))
-        self.btn_save.setFixedWidth(44)
-        self.btn_copy = pill(QPushButton("复制"))
-        self.btn_copy.setFixedWidth(44)
-        self.btn_ok = QPushButton("完成")
-        self.btn_ok.setFixedHeight(26)
-        self.btn_ok.setFixedWidth(56)
-        self.btn_ok.setCursor(Qt.PointingHandCursor)
-        self.btn_ok.setFocusPolicy(Qt.NoFocus)
-        self.btn_ok.setToolTip("完成并复制到剪贴板 (Enter)")
-        self.btn_ok.setStyleSheet(
-            "QPushButton{background:#2E7CF6;color:#FFFFFF;border:none;"
-            "border-radius:6px;font-size:12px;font-weight:600;}"
-            "QPushButton:hover{background:#1E66E0;}")
-        for b in (self.btn_close, self.btn_save, self.btn_copy, self.btn_ok):
-            row.addWidget(b)
+        row.addWidget(self._sep())
+        self.btn_close = ibtn("close", "取消长截图 (Esc)")
+        row.addWidget(self.btn_close)
         # 按钮 → 信号（漏接这组 connect 就是「点击全部无效」的根因）
+        self.btn_pin.clicked.connect(self.sig_pin.emit)
+        self.btn_save.clicked.connect(self.sig_save.emit)
+        self.btn_copy.clicked.connect(self.sig_copy.emit)
+        self.btn_ok.clicked.connect(self.sig_finish.emit)
         self.btn_dir.clicked.connect(lambda: self.sig_dir.emit())
         self.btn_up.clicked.connect(lambda: self.sig_auto.emit(-1))
         self.btn_down.clicked.connect(lambda: self.sig_auto.emit(1))
         self.btn_close.clicked.connect(self.sig_close.emit)
-        self.btn_save.clicked.connect(self.sig_save.emit)
-        self.btn_copy.clicked.connect(self.sig_copy.emit)
-        self.btn_ok.clicked.connect(self.sig_finish.emit)
         eff = QGraphicsDropShadowEffect(self)
         eff.setBlurRadius(16)
         eff.setOffset(0, 2)
         eff.setColor(QColor(0, 0, 0, 52))
         self.setGraphicsEffect(eff)
         self.setStyleSheet(
-            "#lsBar{background:white;border:1px solid #E3E6EB;border-radius:9px;}")
+            "#lsBar{background:white;border:1px solid #E3E6EB;border-radius:10px;}")
+
+    def _sep(self):
+        w = QWidget(self)
+        w.setFixedSize(1, 18)
+        w.setStyleSheet("background:#E5E6EB;")
+        return w
 
     def set_dir(self, d: str):
         self._dir = d
-        self.btn_dir.setText("⇕ 横向" if d == "v" else "⇕ 竖向")
+        vertical = d == "v"
+        self.btn_dir.setIcon(icon("dir_v" if vertical else "dir_h", "#4E5969", 18))
+        self.btn_dir.setToolTip("切换到横向拼接" if vertical else "切换到竖向拼接")
 
     def set_auto(self, direction: int):
-        """direction: 0 空闲 / +1 向下自动滚 / -1 向上（运行中该按钮红色）。"""
-        for b, d in ((self.btn_up, -1), (self.btn_down, 1)):
-            if direction == d:
-                b.setText("■")
-                b.setStyleSheet(
-                    "QPushButton{border:none;border-radius:6px;background:#F53F3F;"
-                    "color:#FFFFFF;font-size:12px;font-weight:600;}"
-                    "QPushButton:hover{background:#D93030;}")
+        """direction: 0 空闲 / +1 向下自动滚 / -1 向上（运行中该按钮红底+方块）。"""
+        for b, d, name in ((self.btn_up, -1, "auto_up"),
+                           (self.btn_down, 1, "auto_down")):
+            running = direction == d
+            b.setProperty("running", running)
+            if running:
+                b.setIcon(icon("stop", "#F53F3F", 18))
+                b.setStyleSheet(self._BTN_RUN_QSS)
             else:
-                b.setText("↑" if d < 0 else "↓")
-                b.setStyleSheet(
-                    "QPushButton{border:none;border-radius:6px;background:white;"
-                    "font-size:12px;color:#4E5969;}"
-                    "QPushButton:hover{background:#F2F3F5;}")
+                b.setIcon(icon(name, "#4E5969", 18))
+                b.setStyleSheet(self._BTN_QSS)
 
     def set_size(self, w: int, h: int):
         self.size_lab.setText(f"{w} × {h}")
@@ -1866,6 +1908,7 @@ class CaptureOverlay(QWidget):
             self._ls_bar.sig_save.connect(self._save_longshot)
             self._ls_bar.sig_copy.connect(self._finish_longshot)
             self._ls_bar.sig_finish.connect(self._finish_longshot)
+            self._ls_bar.sig_pin.connect(self._pin_longshot)
         if self._toolbar is not None:
             self._toolbar.hide()
         bar = self._ls_bar
@@ -1934,9 +1977,8 @@ class CaptureOverlay(QWidget):
                 p.drawRect(1, int(y0) + 1, pix.width() - 3, max(3, int(y1 - y0) - 2))
                 vp = (int(y0), int(y1))
             p.end()
-        note = f"{w} × {h}"
-        if getattr(self, "_ls_rejected", 0):
-            note += f" · 拒 {self._ls_rejected}"
+        # 只在有拒帧时给一行提示；长宽不再显示（用户要求）
+        note = f"拒 {self._ls_rejected} 帧" if getattr(self, "_ls_rejected", 0) else ""
         self._preview.set_pix(pix, note, vp)
         if getattr(self, "_ls_bar", None) is not None:
             self._ls_bar.set_size(w, h)
@@ -2401,13 +2443,24 @@ if __name__ == "__main__":
     ov4._auto_scroll_step = lambda: None
     ov4._toggle_auto_scroll(1)
     assert ov4._ls_auto and ov4._ls_auto_timer.isActive(), "自动滚动应启动"
-    assert ov4._ls_auto_dir == 1 and ov4._ls_bar.btn_down.text() == "■", \
-        "向下自动滚运行中按钮应变红色停止"
+    assert ov4._ls_auto_dir == 1 and ov4._ls_bar.btn_down.property("running"), \
+        "向下自动滚运行中按钮应进入运行态"
     ov4._toggle_auto_scroll(-1)                    # 反向：换向继续
-    assert ov4._ls_auto and ov4._ls_auto_dir == -1 and ov4._ls_bar.btn_up.text() == "■"
+    assert ov4._ls_auto and ov4._ls_auto_dir == -1 and \
+        ov4._ls_bar.btn_up.property("running")
     ov4._toggle_auto_scroll(-1)                    # 再点同方向：停止
     assert not ov4._ls_auto and not ov4._ls_auto_timer.isActive(), \
         "自动滚动应停止"
+    # ---- 工具栏：全图标（无文字）+ 钉图按钮；预览窗加宽 + 穿透接口
+    assert not ov4._ls_bar.btn_ok.text(), "完成按钮不应用文字"
+    assert not ov4._ls_bar.btn_save.text(), "保存按钮不应用文字"
+    assert not ov4._ls_bar.btn_copy.text(), "复制按钮不应用文字"
+    assert ov4._ls_bar.btn_pin.toolTip() == "钉到桌面", "应有钉图按钮"
+    pv4 = ov4._preview
+    assert pv4 is not None and pv4.V_W >= 190, \
+        f"竖向预览窗应加宽（>=190），实际 {getattr(pv4, 'V_W', 0)}"
+    pv4._set_click_through(True)                   # offscreen 无真实 HWND：只验不抛
+    pv4._set_click_through(False)
     ov4._exit_longshot()
     assert ov4._ls_stitched is None and not ov4._ls_timer.isActive(), \
         "退出应释放长图并停止定时器"
@@ -2508,8 +2561,9 @@ if __name__ == "__main__":
     want9 = doc9[::-1, :320].astype(np.int16)              # (300, 320)
     assert (np.abs(got9.T - want9) <= 3).mean() > 0.98, \
         "横向拼接内容应逐列等于源文档"
-    assert "320 × 300" in ov9._preview.status.text(), \
-        f"状态行应显示原始方向尺寸: {ov9._preview.status.text()}"
+    # 预览窗不再显示长宽（用户要求），状态行只可能在有拒帧时出现文字
+    assert "×" not in ov9._preview.status.text(), \
+        f"预览状态行不应再显示长宽: {ov9._preview.status.text()}"
     ov9._exit_longshot()
 
     # ---- 大位移跳滚：搜索窗口内找不到就丢帧、绝不硬拼；滚回窗口内自动恢复

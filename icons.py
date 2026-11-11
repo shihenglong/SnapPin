@@ -22,6 +22,12 @@ _P = {
     "serial":    '<circle cx="12" cy="12" r="8.5"/>'
                  '<text x="12" y="15.8" font-size="9" font-family="Segoe UI" font-weight="600" text-anchor="middle" stroke="none" fill="currentColor">1</text>',
     "close":     '<path d="M6 6 L18 18 M18 6 L6 18"/>',
+    "check":     '<path d="M5 12.5 L9.5 17 L19 7"/>',
+    "dir_v":     '<path d="M12 3 v18 M8.5 6.5 L12 3 L15.5 6.5 M8.5 17.5 L12 21 L15.5 17.5"/>',
+    "dir_h":     '<path d="M3 12 h18 M6.5 8.5 L3 12 L6.5 15.5 M17.5 8.5 L21 12 L17.5 15.5"/>',
+    "auto_up":   '<path d="M12 20 V5 M7 10 L12 5 L17 10"/>',
+    "auto_down": '<path d="M12 4 V19 M7 14 L12 19 L17 14"/>',
+    "stop":      '<rect x="7" y="7" width="10" height="10" rx="1.6"/>',
     "ocr":       '<path d="M4 8 V5.5 A1.5 1.5 0 0 1 5.5 4 H8 M16 4 h2.5 A1.5 1.5 0 0 1 20 5.5 V8 M20 16 v2.5 a1.5 1.5 0 0 1 -1.5 1.5 H16 M8 20 H5.5 A1.5 1.5 0 0 1 4 18.5 V16 M8 10 v4 M12 9.5 v5 M16 10 v4"/>',
     "save":      '<path d="M12 4 v10 M8 10.5 l4 4 4-4 M5 19.5 h14"/>',
     "copy":      '<rect x="8.5" y="8.5" width="11" height="11" rx="1.5"/>'
