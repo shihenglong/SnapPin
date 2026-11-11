@@ -260,10 +260,11 @@ class LongshotPreview(QWidget):
         scr = self.screen() or QApplication.primaryScreen()
         g = scr.availableGeometry() if scr else None
         if self._hdir:
-            # 横向：高度由内容定，宽度封顶（长图越来越长不该把面板撑穿屏幕）
+            # 横向：面板宽度**从第一帧起就固定**（用户明确要求：不要先随内容
+            # 变宽、超过一定长度才固定住），内部滚动承接超长内容
             avail = (g.width() - 60) if g else self.MAX_W
-            w = min(pix.width() + self.PAD, self.MAX_W, avail)
-            self.setFixedSize(max(120, w), pix.height() + self.PAD)
+            w = min(self.MAX_W, max(120, avail))
+            self.setFixedSize(w, pix.height() + self.PAD)
         else:
             avail = (g.height() - 90) if g else self.MAX_H
             h = min(pix.height() + self.PAD, self.MAX_H, avail)
@@ -1934,9 +1935,10 @@ class CaptureOverlay(QWidget):
                 self._ls_full = True
         elif st == longshot_pixpin.ERR_BOTTOM:
             # 无新内容（静止 / 滚回已捕获区）：长图不动，但用户视口回到
-            # 了长图行 off——预览跟随（PixPin 同样用该锚点同步视口）
+            # 了长图行 off——绿框必须跟着走（PixPin 同样用该锚点同步视口）
             self._ls_view = off
             self._ls_miss = getattr(self, "_ls_miss", 0) + 1
+            self._update_preview()
         else:
             self._ls_rejected += 1
             self._ls_miss = 0
@@ -2006,11 +2008,14 @@ class CaptureOverlay(QWidget):
         if self._preview is None or self._ls_stitched is None:
             return
         now = time.monotonic()
+        # 节流：长度没长够 8 行且**视口没动**才跳过——视口变了绿框必须重画
+        view_moved = self._ls_view != getattr(self, "_ls_preview_view", -1)
         if not force and self._ls_preview_h and \
-                self._ls_len - self._ls_preview_h < 8 and \
+                self._ls_len - self._ls_preview_h < 8 and not view_moved and \
                 now - self._ls_preview_t < 0.12:
             return
         self._ls_preview_h = self._ls_len
+        self._ls_preview_view = self._ls_view
         self._ls_preview_t = now
         c = self._ls_stitched
         hdir = getattr(self, "_ls_dir", "v") == "h"
