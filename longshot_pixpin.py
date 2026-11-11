@@ -61,16 +61,16 @@ ERR_NO_MATCH = 2         # 没匹配上
 def row_profile(frame_rgb: np.ndarray) -> np.ndarray:
     """帧 → 行投影（`0x1400CDE60`）。
 
-    PixPin：`cv::cvtColor(..., COLOR_RGB2GRAY)` → `cv::resize(dsize={32, rows},
-    INTER_AREA)` → `cv::boxFilter(ksize={1,15}, anchor=(-1,-1), normalize=true)`。
-    横向压缩到 32 宽（纵向不变），再纵向 15 像素滑动平均——平滑后同一内容
-    行的汉明距离才足够小，投票才有区分度。
-    """
+    三步全对齐伪代码：通道转换 → `cv::resize(dsize={32, rows}, INTER_AREA)`
+    （FUN_14031cd00，interpolation=3）→ `cv::GaussianBlur(ksize={1, K_BOX},
+    sigmaX=-1（按核自动）, borderType=REFLECT_101)`（FUN_140329a40，
+    纵向核）。纵向平滑是必要抗噪：抓帧时机相对滚动动画有 ±几像素抖动，
+    无平滑时匹配峰发散、投票分裂（真机实测掉到 6/12）。"""
     gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
     h = gray.shape[0]
     prof = cv2.resize(gray, (W_PROFILE, h), interpolation=cv2.INTER_AREA)
-    prof = cv2.boxFilter(prof, -1, (1, K_BOX), normalize=True,
-                         anchor=(-1, -1), borderType=cv2.BORDER_REFLECT_101)
+    prof = cv2.GaussianBlur(prof, (1, K_BOX), sigmaX=-1,
+                            borderType=cv2.BORDER_REFLECT_101)
     return np.ascontiguousarray(prof)
 
 
