@@ -72,6 +72,38 @@ def _protect_codes(texts):
     return out
 
 
+_CSS_COMMENT = re.compile(r"/\*\s*([A-Za-z][^*/]{2,160}?)\s*\*/")
+
+
+def _extract_comments(prot):
+    """把 /* 英文注释 */ 抽成占位：注释是自然语言（代码块里唯一该翻的
+    部分），注释文本记为待翻行并追加到 token 表尾部（占位 zzJJzz 走统一
+    还原）；未翻/失败时 token 保持英文原文，注释原样保留、代码主体不受
+    引擎乱码影响。返回 [(行下标, tok 下标, 注释文本)]。"""
+    jobs = []
+    for i, (t, toks) in enumerate(prot):
+        def _csub(m):
+            inner = m.group(1).strip()
+            j = len(toks)
+            toks.append(inner)
+            jobs.append((i, j, inner))
+            return f"/* zz{j:02d}zz */"
+
+        t2 = _CSS_COMMENT.sub(_csub, t)
+        prot[i] = (t2, toks)
+    return jobs
+
+
+def _needs_mt_cmt(inner: str) -> bool:
+    """注释是自然语言的强标志：不做停用词检查，只要求拉丁主导。"""
+    letters = [ch for ch in inner if ch.isalpha()]
+    if not letters:
+        return False
+    cjk = sum(1 for ch in letters
+              if "\u2e80" <= ch <= "\u9fff" or "\u3400" <= ch <= "\u4dbf")
+    return cjk * 2 < len(letters)
+
+
 def _restore_codes(line: str, toks: list[str]) -> str:
     """占位还原；下标越界（引擎吞/改占位）时保守保留原样。"""
 
@@ -510,9 +542,13 @@ class TranslateClient(QObject):
         的预期；拉丁字母主导的行才真正送翻。"""
         to = _LOCAL_LANG.get((target or "zh-CN").lower(), "zh")
         prot = _protect_codes(texts)
+        cmt = _extract_comments(prot)                  # [(行下标, tok 下标, 注释)]
+        cmt_pending = [(li, j, inner) for li, j, inner in cmt
+                       if _needs_mt_cmt(inner)]
+        cmt_send = [inner for _li, _j, inner in cmt_pending]
         send = [i for i, (t, toks) in enumerate(prot) if _needs_mt(t, len(toks))]
-        if not send:
-            self.last_engine = "离线（无英文内容行）"
+        if not send and not cmt_send:
+            self.last_engine = "离线（无可翻译文本，代码原样保留）"
             self.done.emit(list(texts), tag)
             return
         fd_in, path_in = tempfile.mkstemp(suffix=".txt", prefix="snappin_tr_")
@@ -521,8 +557,9 @@ class TranslateClient(QObject):
         os.close(fd_out)
         try:
             with open(path_in, "w", encoding="utf-8") as f:
-                f.write("\n".join(prot[i][0].replace("\n", " ")
-                                  for i in send))
+                f.write("\n".join(
+                    ([prot[i][0].replace("\n", " ") for i in send]
+                     + cmt_send)))
         except OSError:
             self.failed.emit("离线插件输入文件写入失败", tag)
             return
@@ -553,13 +590,24 @@ class TranslateClient(QObject):
                 self.failed.emit("离线翻译插件执行失败", t)
                 return
             lines = out.splitlines()
-            lines = [ln.strip() for ln in lines][:len(send)]
-            while len(lines) < len(send):             # 引擎少数行 → 原文兜底
-                lines.append(prot[send[len(lines)]][0])
-            # 占位还原 + 展开回全量（未送翻的中文行原样保留）
+            lines = [ln.strip() for ln in lines]
+            n_main = len(send)
+            sent_set = set(send)
             full = list(texts)
-            for j, i in enumerate(send):
-                full[i] = _restore_codes(lines[j], prot[i][1])
+            for k, i in enumerate(send):
+                if k < n_main and lines[k]:
+                    full[i] = _restore_codes(lines[k], prot[i][1])
+            # 注释译文回填 token 表（缺行/失败保持英文原文，注释原样保留）
+            cmt_out = lines[n_main:n_main + len(cmt_pending)]
+            for (li, j, _inner), zh in zip(cmt_pending, cmt_out):
+                if zh.strip():
+                    prot[li][1][j] = zh
+            # 统一占位还原（含 /* zz..zz */ → /* 中文译文 */）。
+            # 未送翻行必须以「受保护文本」为底：它的占位（含注释占位）只有
+            # 在还原时才会变成中文译文/原 token。
+            for i, (pt, toks) in enumerate(prot):
+                if i not in sent_set:
+                    full[i] = _restore_codes(pt, toks)
             lines = full
             if m is not None:                         # 在线直连的缺口补齐模式
                 base, indices = m
