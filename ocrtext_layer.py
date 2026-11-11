@@ -29,7 +29,6 @@ from PySide6.QtWidgets import QGraphicsItem
 
 # PixPin 实测：+0x88 = QColor(0x33,0x99,0xff,0x7f)
 HILITE = QColor(0x33, 0x99, 0xff, 0x7f)
-FRAME_PEN = QPen(QColor(0x33, 0x99, 0xff, 0x9a), 1)
 
 
 class OcrGraphicsTextItem(QGraphicsItem):
@@ -144,19 +143,18 @@ class OcrGraphicsTextItem(QGraphicsItem):
 
     # -------------------------------------------------- 绘制
     def paint(self, p, option, widget=None):
-        p.setRenderHint(p.RenderHint.Antialiasing, True)
-        # 块框：细蓝线（PixPin 的 OCR 图层态）
-        p.setPen(FRAME_PEN)
-        p.setBrush(Qt.NoBrush)
-        p.drawPolygon(self.quad)
+        """只在选中时画逐字符高亮。
+
+        PixPin 的 OCR 图层默认**不可见**（不画常驻框）：一屏文字全被蓝线框住
+        既吵又盖住原图内容。命中判定不看绘制，不画框照样能选字。
+        """
         if not self.has_selection():
             return
-        # 选中字符高亮：逐字符四边形填充
+        p.setRenderHint(p.RenderHint.Antialiasing, True)
         p.setPen(Qt.NoPen)
         p.setBrush(QBrush(HILITE))
         for i in range(self.sel_start, self.sel_end + 1):
-            q = self.char_quad(i)
-            p.drawPolygon(q)
+            p.drawPolygon(self.char_quad(i))
 
 
 class OcrTextItemLayer(QGraphicsItem):
@@ -213,14 +211,27 @@ class OcrTextItemLayer(QGraphicsItem):
 
     # -------------------------------------------------- 命中
     def hit_test(self, pos: QPointF):
-        """返回命中的 item（等价 PixPin 选字交互 `0x14005f0f0` 的模式判定）。"""
+        """返回命中的 item（等价 PixPin 选字交互 `0x14005f0f0` 的模式判定）。
+
+        判定用「x 在块宽内 + y 在半个行高的容差内」，不是严格外接矩形：
+        块高常只有 12~15px，严格判定会让鼠标稍偏就落空（表现为点不到字、
+        拖不了选）；容差取半个行高，仍小于行间距，不会串到相邻行。
+        多个块覆盖同一点时取 y 距离最近的。
+        """
+        best, best_dy = None, 1e18
         for it in self.items:
-            xs = [p.x() for p in it.quad]
-            ys = [p.y() for p in it.quad]
-            if min(xs) - 2 <= pos.x() <= max(xs) + 2 and \
-                    min(ys) - 2 <= pos.y() <= max(ys) + 2:
-                return it
-        return None
+            xs = [q.x() for q in it.quad]
+            ys = [q.y() for q in it.quad]
+            if not (min(xs) - 4 <= pos.x() <= max(xs) + 4):
+                continue
+            lo, hi = min(ys), max(ys)
+            tol = max(4.0, (hi - lo) * 0.5)
+            if lo - tol <= pos.y() <= hi + tol:
+                dy = 0.0 if lo <= pos.y() <= hi else \
+                    min(abs(pos.y() - lo), abs(pos.y() - hi))
+                if dy < best_dy:
+                    best, best_dy = it, dy
+        return best
 
     # -------------------------------------------------- 流式选择
     def begin_selection(self, pos: QPointF):
@@ -235,13 +246,18 @@ class OcrTextItemLayer(QGraphicsItem):
         if self._anchor is None:
             return
         it = self.hit_test(pos)
-        if it is None:                       # 拖出文字区：夹到最近的块
-            last = self.items[-1]
-            it = last if pos.y() >= last.quad[0].y() else self.items[0]
-            ci = 0 if it is self.items[0] else len(it.text) - 1
-        else:
-            ci = it.char_at(pos)
-        self._cursor = (it, ci)
+        if it is None:
+            # 拖出块界：块高只有十几像素，鼠标上下微动就出界。这里挑「y 方向
+            # 最近的块」并在块内按 clamp 后的 t 定位——绝不能直接跳首/末字符，
+            # 那会让一次普通拖拽变成整块全选（看起来「只能整段选」）。
+            def _dy(item):
+                ys = [q.y() for q in item.quad]
+                lo, hi = min(ys), max(ys)
+                if lo <= pos.y() <= hi:
+                    return 0.0
+                return min(abs(pos.y() - lo), abs(pos.y() - hi))
+            it = min(self.items, key=_dy)
+        self._cursor = (it, it.char_at(pos))
         self._apply_selection(self._anchor, self._cursor)
 
     def end_selection(self):
@@ -308,6 +324,8 @@ if __name__ == "__main__":                               # pragma: no cover
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     import sys
 
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QImage, QPainter
     from PySide6.QtWidgets import QApplication, QGraphicsScene
 
     app = QApplication(sys.argv)
@@ -370,4 +388,32 @@ if __name__ == "__main__":                               # pragma: no cover
     layer.begin_selection(QPointF(5, 10))
     layer.drag_selection(QPointF(200, 200))
     assert layer.selection_text().endswith("end"), layer.selection_text()
-    print("ocrtext_layer 自测通过: 字符区间/二分命中/四边形插值/跨块流式选择 OK")
+
+    # ---- 默认不可见：未选中时渲染不出任何像素（PixPin 不画常驻框）
+    layer.clear_selection()
+    canvas = QImage(220, 140, QImage.Format_ARGB32)
+    canvas.fill(Qt.transparent)
+    pp = QPainter(canvas)
+    scene.render(pp)
+    pp.end()
+    opaque = sum(1 for y in range(0, 140, 2) for x in range(0, 220, 2)
+                 if canvas.pixelColor(x, y).alpha() > 0)
+    assert opaque == 0, f"未选中时不应画任何框（实到 {opaque} 个不透明采样点）"
+
+    # ---- 块高只有十几像素：点在块上下半个行高内仍要能命中（否则拖不动）
+    it0 = layer.items[0]                       # quad y=0..20
+    assert layer.hit_test(QPointF(50, -6)) is it0, "块上方半行内应命中"
+    assert layer.hit_test(QPointF(50, 26)) is it0, "块下方半行内应命中"
+    assert layer.hit_test(QPointF(50, 34)) is layer.items[1], \
+        "块间空白处应命中更近的那一块"
+    assert layer.hit_test(QPointF(50, 140)) is None, "远离所有块不应命中"
+
+    # ---- 块内拖拽即使划出块界，也按 clamp 定位而不是整段全选
+    layer.clear_selection()
+    layer.begin_selection(QPointF(40, 10))     # 40/100 → 第 3 个字符
+    layer.drag_selection(QPointF(70, 28))      # 竖直划出块 1 底边，但未进入块 2
+    r3 = layer.selection_ranges()
+    assert len(r3) == 1, f"未跨块时不应跳到别的块: {r3}"
+    assert (r3[0][1], r3[0][2]) == (2, 3), f"应只选中部分字符: {r3}"
+    print("ocrtext_layer 自测通过: 字符区间/二分命中/四边形插值/跨块流式选择/"
+          "默认无框/出界不整选 OK")

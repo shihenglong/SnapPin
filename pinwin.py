@@ -120,8 +120,13 @@ class _TextLayerView(QGraphicsView):
             e.accept()
             return
         pos = self._scene_pos(e)
-        self.setCursor(Qt.IBeamCursor if layer.hit_test(pos) is not None
-                       else Qt.SizeAllCursor)
+        hit = layer.hit_test(pos) is not None
+        self.setCursor(Qt.IBeamCursor if hit else Qt.SizeAllCursor)
+        if not (e.buttons() & Qt.LeftButton):
+            # 悬停：只管光标，不转发——转给 PinWindow 会把它设成"移动"箭头，
+            # 用户就以为文字不可选（表现为「拖不了选字」）
+            e.accept()
+            return
         e.ignore()
         self._forward(e, self._win.mouseMoveEvent)
 
