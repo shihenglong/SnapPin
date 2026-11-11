@@ -449,12 +449,28 @@ class App:
 
     # ------------------------------------------------ 设置
     def open_settings(self):
-        """非模态单例：已打开则激活；不阻塞截图/贴图/热键等任何窗口。"""
-        from settings_ui import SettingsDialog
-        if self._settings_dlg is None:
-            self._settings_dlg = SettingsDialog(self.cfg, self._apply_settings)
-            self._settings_dlg._app = self  # 扩展设置页回调（打开密码管理等）
-        self._settings_dlg.show_up()
+        """非模态单例：已打开则激活；不阻塞截图/贴图/热键等任何窗口。
+
+        pythonw 没有控制台，托盘槽里的异常会被静默吞掉（表现为「点了没
+        反应」）——这里落盘日志 + 托盘气泡提示，不再无声失败。"""
+        try:
+            from settings_ui import SettingsDialog
+            if self._settings_dlg is None:
+                self._settings_dlg = SettingsDialog(self.cfg, self._apply_settings)
+                self._settings_dlg._app = self  # 扩展设置页回调（打开密码管理等）
+            self._settings_dlg.show_up()
+        except Exception:
+            import os
+            import traceback
+            log = os.path.join(os.environ.get("TEMP", os.getcwd()),
+                               "SnapPin_error.log")
+            try:
+                with open(log, "a", encoding="utf-8") as f:
+                    f.write(traceback.format_exc() + "\n")
+            except OSError:
+                pass
+            self.tray.showMessage("SnapPin", f"打开设置失败，详见 {log}",
+                                  QSystemTrayIcon.Warning, 4000)
 
     def _apply_settings(self):
         config.save(self.cfg)

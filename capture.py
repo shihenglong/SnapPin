@@ -335,6 +335,10 @@ class LongshotToolbar(QWidget):
         # 「透明底 + 每个按钮一块白底 + 整体投影」。
         self.setAttribute(Qt.WA_TranslucentBackground)
         self._dir = "v"
+        self._w = self._h = 0
+        self._flash_timer = QTimer(self, singleShot=True)
+        self._flash_timer.timeout.connect(
+            lambda: self.set_size(self._w, self._h))
         row = QHBoxLayout(self)
         row.setContentsMargins(4, 3, 4, 3)
         row.setSpacing(1)
@@ -440,12 +444,21 @@ class LongshotToolbar(QWidget):
     def set_size(self, w: int, h: int):
         """只在数字真变时重排：每帧 adjustSize 会让窗口反复改变尺寸，
         屏幕合成时容易撞到半布局状态（显示成一条灰条）。"""
+        self._w, self._h = w, h
         text = f"{w} × {h}"
+        if self._flash_timer is not None and self._flash_timer.isActive():
+            return                       # 提示闪显期间不动尺寸文本
         if text == self.size_lab.text():
             return
         self.size_lab.setText(text)
         self.size_lab.adjustSize()
         self.adjustSize()
+
+    def flash(self, msg: str, ms: int = 2000):
+        """尺寸标签临时换成提示文本（如「再按一次 Esc 退出长截图」）。"""
+        self.size_lab.setText(msg)
+        self.size_lab.adjustSize()
+        self._flash_timer.start(ms)
 
 
 # ---------------------------------------------------------------- GIF 录制状态条
@@ -902,7 +915,15 @@ class CaptureOverlay(QWidget):
             self._stop_gif(save=False)
             return
         if getattr(self, "_longshot", False):
-            self._exit_longshot()
+            # 长截图内容珍贵，一键 Esc 直接全丢太容易误触：两下才退出，
+            # 第一下在工具栏提示（2 秒内再按生效）
+            now = time.monotonic()
+            if now - getattr(self, "_ls_esc_t", 0.0) < 2.0:
+                self._exit_longshot()
+                return
+            self._ls_esc_t = now
+            if self._ls_bar is not None:
+                self._ls_bar.flash("再按一次 Esc 退出长截图")
             return
         self._cancel()
 
@@ -1732,6 +1753,7 @@ class CaptureOverlay(QWidget):
         self._ls_dir = "v"        # 拼接方向：v=上下滚动 / h=左右滚动
         self._ls_prev = None      # 最近一帧（管线态，预览窗画视口框用）
         self._ls_stitched = None  # 长图（管线态；横向为转置态）
+        self._ls_esc_t = 0.0      # 双击 Esc 退出的第一下时间戳
         self._ls_len = 0
         self._ls_view = 0
         self._ls_full = False
@@ -2378,6 +2400,18 @@ if __name__ == "__main__":
     ov2._on_tool_action("copy")
     ov2._on_tool_action("rect")
     assert finished == [] and ov2._longshot is True, "长截图进行中双击/复制/切工具应被忽略"
+
+    # ---- 双 Esc 才能退出长截图（防误触）：第一下提示，第二下退出
+    ov2._ls_bar = LongshotToolbar(ov2)
+    ov2._exit_longshot = lambda: exited.append(True)
+    exited = []
+    ov2.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Escape, Qt.NoModifier))
+    assert exited == [] and ov2._longshot is True, "第一下 Esc 只提示不退出"
+    assert ov2._ls_bar.size_lab.text() == "再按一次 Esc 退出长截图", \
+        f"第一下 Esc 应提示: {ov2._ls_bar.size_lab.text()}"
+    ov2.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Escape, Qt.NoModifier))
+    assert exited == [True], "2 秒内第二下 Esc 应退出长截图"
+    del ov2._exit_longshot                    # 摘掉 stub，还原真实收尾方法
 
     # ---- 交互：选区外单击延伸该侧边框 / 双击（即使选中了绘图工具）复制关闭 / Esc 取消
     ov11 = CaptureOverlay(app.primaryScreen(), config.load())
