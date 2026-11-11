@@ -183,17 +183,17 @@ class PixPinLongShot:
                 return ERR_NO_MATCH, 0, float(conf)
             delta = int(vals[order[0]])
 
-        # 绝对位移 = 窗口起点 + 冠军 Δ
+        # 绝对位移 = 窗口起点 + 冠军 Δ，**保留符号**。
+        # 逐条对齐 0x1400CE530：
+        #   *param_3 = iVar11;                    → 负值原样作为输出位移
+        #   if (iVar11 < 0) { ...; iVar11 = 0; }  → 只是把搜索锚点归 0
+        #   merge(dst, src, *param_3)             → 负 offset 走前插
+        #   （merge 0x1400CDA00 开头 if (param_3 < 0) param_3 = -param_3）
+        # 之前我把「锚点归 0」误读成「位移被丢弃」，才导致上滚/左滚无效。
         offset = start + delta
-        if offset < 0:
-            offset = 0                                  # 负值截 0（同 PixPin）
-        self.last_offset = offset
-
-        # 画布空间判定（ERR_BOTTOM）：新长度 = block + offset，超出参考总高即到底
-        new_len = self.block + offset
-        if rows_ref >= new_len and offset == 0:
-            # 参考图已经完全覆盖该位置：没有新内容
-            return ERR_BOTTOM, offset, float(conf)
+        self.last_offset = offset if offset >= 0 else 0
+        if offset == 0:
+            return ERR_BOTTOM, 0, float(conf)      # 位移为 0：没有新内容
         return ERR_OK, offset, float(conf)
 
     # ------------------------------------------------------------ 拼接

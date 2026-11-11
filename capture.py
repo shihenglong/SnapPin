@@ -387,15 +387,27 @@ class LongshotToolbar(QWidget):
         self.btn_down.clicked.connect(lambda: self.sig_auto.emit(1))
         self.btn_close.clicked.connect(self.sig_close.emit)
         eff = QGraphicsDropShadowEffect(self)
-        eff.setBlurRadius(16)
-        eff.setOffset(0, 2)
+        eff.setBlurRadius(18)
+        eff.setOffset(0, 3)
         eff.setColor(QColor(0, 0, 0, 150))
         self.setGraphicsEffect(eff)
-        # 与普通截图工具栏逐字同款（选择器换成 #lsBar）
+        # 按钮与普通截图工具栏同款；容器底由 paintEvent 画成半透明玻璃
         self.setStyleSheet(
-            "#lsBar{background:white;border:1px solid #E3E6EB;border-radius:9px;}"
-            "QToolButton{border:none;border-radius:7px;padding:2px;background:white;}"
-            "QToolButton:hover{background:#F2F3F5;}")
+            "QToolButton{border:none;border-radius:8px;padding:2px;background:white;}"
+            "QToolButton:hover{background:#F2F3F5;}"
+            "QLabel{background:rgba(255,255,255,190);}")
+
+    def paintEvent(self, _):
+        """半透明「玻璃」底 + 14px 圆角。
+
+        全透明会让工具栏在灰色网页上糊成一片、纯白又太突兀；半透明白
+        (alpha 168) 在任何背景上都有质感，圆角放大到 14 更柔和。"""
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(QPen(QColor(255, 255, 255, 130), 1))
+        p.setBrush(QColor(255, 255, 255, 168))
+        p.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 14, 14)
+        p.end()
 
     def _sep(self):
         w = QWidget(self)
