@@ -145,7 +145,7 @@ class LongshotPreview(QWidget):
 
     V_W = 204                    # 竖向面板宽度（内容 200 + 边框/边距 4）
     CAP_V_W = 200                # 竖向目标内容宽（缩放基准）
-    CAP_H_H = 200                # 横向目标内容高（缩放基准）
+    CAP_H_H = 150                # 横向目标内容高（缩放基准，用户要求再缩小）
     HOVER_OPACITY = 0.22         # 悬停时的不透明度
     PAD = 4                      # 上下边距合计（contentsMargins 2+2）
 
@@ -1826,7 +1826,7 @@ class CaptureOverlay(QWidget):
         self._ls_stitched = self._pp.canvas
         self._ls_len = int(self._pp.canvas.shape[0])
         self._ls_prev = (frame if self._ls_dir == "v"
-                         else np.ascontiguousarray(frame.transpose(1, 0, 2)))
+                         else np.ascontiguousarray(np.rot90(frame, k=-1)))
         self._ls_view = 0
         self._ls_miss = 0
         self._update_preview(force=True)
@@ -1910,7 +1910,7 @@ class CaptureOverlay(QWidget):
             self._ls_len = int(eng.canvas.shape[0])
             self._ls_view = offset
             self._ls_prev = (cur if self._ls_dir == "v"
-                             else np.ascontiguousarray(cur.transpose(1, 0, 2)))
+                             else np.ascontiguousarray(np.rot90(cur, k=-1)))
             self._ls_miss = 0
             self._update_preview()
             # 长图内存保护：PixPin 每帧整图重拷、不设上限；这里到 150MB 停
@@ -1972,7 +1972,8 @@ class CaptureOverlay(QWidget):
         if bar is None:
             return
         bar.adjustSize()
-        bx = self._sel.x()
+        # 与普通截图工具栏一致：靠选区右边缘对齐（用户实测两处位置不同）
+        bx = self._sel.right() - bar.width() + 1
         by = self._sel.bottom() + 8
         if by + bar.height() > self.height() - 4:
             by = self._sel.y() - bar.height() - 8
@@ -1994,8 +1995,11 @@ class CaptureOverlay(QWidget):
         self._ls_preview_t = now
         c = self._ls_stitched
         hdir = getattr(self, "_ls_dir", "v") == "h"
-        if hdir:                                     # 管线内是转置帧，出口转回
-            c = c.transpose(1, 0, 2)
+        if hdir:
+            # 必须 rot90(k=1) 而不是 transpose：引擎用 rot90(k=-1) 进管线，
+            # 逆变换 = 转置 + 上下翻转。只转置会让整张长图上下颠倒（用户实测
+            # 「文字正反不对」就是这个）
+            c = np.ascontiguousarray(np.rot90(c, k=1))
         h, w = c.shape[:2]
         self._preview.freeze(hdir, self._sel.width(), self._sel.height())
         scale = self._preview._scale
@@ -2063,8 +2067,9 @@ class CaptureOverlay(QWidget):
 
     def _longshot_pixmap(self) -> QPixmap:
         c = self._ls_stitched
-        if getattr(self, "_ls_dir", "v") == "h":   # 管线内是转置帧，出口转回
-            c = np.ascontiguousarray(c.transpose(1, 0, 2))
+        if getattr(self, "_ls_dir", "v") == "h":
+            # 与 _update_preview 同：rot90(k=1)，不是裸转置
+            c = np.ascontiguousarray(np.rot90(c, k=1))
         h, w = c.shape[:2]
         data = c.tobytes()        # 必须持有引用：QImage 不拥有内存
         img = QImage(data, w, h, w * 3, QImage.Format_RGB888)
