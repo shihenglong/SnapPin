@@ -168,10 +168,16 @@ class LongshotPreview(QWidget):
         self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.scroll.setStyleSheet("QScrollArea{background:transparent;border:none;}")
+        # QSS 的 background 只作用于 QScrollArea 本身；真正铺底的是它的
+        # viewport 子控件（默认 palette base）。不显式置透明，内容比面板小时
+        # 下半截就露出一块底色 —— 用户看到的「预览窗下半黑」。
+        self.scroll.viewport().setStyleSheet("background:transparent;")
+        self.scroll.viewport().setAutoFillBackground(False)
         self.lab = QLabel()
         self.lab.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.lab.setStyleSheet(
             "background:transparent;color:#7C8595;font-size:11px;")
+        self.lab.setAttribute(Qt.WA_TranslucentBackground, True)
         self.lab.setText("滚动页面\n开始拼接")
         self.lab.resize(160, 200)
         self.scroll.setWidget(self.lab)
@@ -262,7 +268,9 @@ class LongshotPreview(QWidget):
         else:
             avail = (g.height() - 90) if g else self.MAX_H
             h = min(pix.height() + self.PAD, self.MAX_H, avail)
-            self.setFixedSize(self.V_W, max(90, h))
+            # 不能有 90px 这种硬下限：内容只有一屏时窗口被撑大，viewport
+            # 比缩略图高出一截，底部就是一条黑边（用户实测）
+            self.setFixedSize(self.V_W, max(24, h))
         sb = (self.scroll.horizontalScrollBar() if self._hdir
               else self.scroll.verticalScrollBar())
         span = (self.scroll.viewport().width() if self._hdir
