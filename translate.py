@@ -38,6 +38,45 @@ _LOCAL_EXE = os.path.join(_TR_PLUGIN, "engine", "translate-engine.exe")
 _LOCAL_LANG = {"zh": "zh", "zh-cn": "zh", "zh-tw": "zh", "en": "en",
                "ja": "ja", "ko": "ko"}
 
+# ---- 技术代码 token 保护 ----------------------------------------------
+# 离线引擎对 CSS 属性对/标签/路径这类 ASCII 代码词会逐词错译
+# （white-space→「白- 空格」、overflow-x→「express- x」，用户实测）。
+# 翻译前抽成字母数字占位 zz0zz（引擎实测 100% 原样保留），译后还原。
+_CODE_TOKEN = re.compile(
+    r"https?://\S+?"                                        # URL
+    r"|<!?/?[A-Za-z][^<>{}]{0,60}?>"                        # HTML/XML 标签
+    r"|#[0-9a-fA-F]{3,8}\b"                                 # 十六进制色
+    r"|[A-Za-z][A-Za-z0-9_-]*\s*:\s*[A-Za-z0-9][A-Za-z0-9.-]*"  # CSS 属性对（值限单 token）
+    r"|\b[A-Za-z]+(?:[-_][A-Za-z0-9]+)+\b"                  # 连字符/下划线词
+    r"|\b[\w.-]+\.(?:html|htm|css|js|json|py|png|jpe?g|gif|md|txt|yaml|yml|ini|bat|sh)\b"
+)
+_PLACEHOLDER = re.compile(r"zz(\d{1,3})zz")
+
+
+def _protect_codes(texts):
+    """texts → (受保护文本列表, 每条的 token 表)。"""
+    out = []
+    for t in texts:
+        toks: list[str] = []
+
+        def _sub(m):
+            toks.append(m.group(0))
+            return f"zz{len(toks) - 1:02d}zz"
+
+        out.append((_CODE_TOKEN.sub(_sub, t), toks))
+    return out
+
+
+def _restore_codes(line: str, toks: list[str]) -> str:
+    """占位还原；下标越界（引擎吞/改占位）时保守保留原样。"""
+
+    def _sub(m):
+        i = int(m.group(1))
+        return toks[i] if i < len(toks) else m.group(0)
+
+    return _PLACEHOLDER.sub(_sub, line)
+
+
 _OLLAMA_HOST = "http://localhost:11434"
 _OLLAMA_PREFS = ("qwen", "deepseek", "glm")   # 模型自动检测优先级
 _TIMEOUT_MS = 20_000
@@ -435,13 +474,14 @@ class TranslateClient(QObject):
     def _local_translate(self, texts: list, target: str, tag: int, merge=None):
         """merge=(base_results, indices)：只把结果写回指定下标后整体发出。"""
         to = _LOCAL_LANG.get((target or "zh-CN").lower(), "zh")
+        prot = _protect_codes(texts)
         fd_in, path_in = tempfile.mkstemp(suffix=".txt", prefix="snappin_tr_")
         fd_out, path_out = tempfile.mkstemp(suffix=".txt", prefix="snappin_tr_")
         os.close(fd_in)
         os.close(fd_out)
         try:
             with open(path_in, "w", encoding="utf-8") as f:
-                f.write("\n".join(t.replace("\n", " ") for t in texts))
+                f.write("\n".join(t.replace("\n", " ") for t, _ in prot))
         except OSError:
             self.failed.emit("离线插件输入文件写入失败", tag)
             return
@@ -475,6 +515,9 @@ class TranslateClient(QObject):
             lines = [ln.strip() for ln in lines][:n]
             while len(lines) < n:                     # 引擎少数行 → 原文兜底
                 lines.append(texts[len(lines)])
+            # 占位还原：engine 少数行兜底的那几条本来就是原文，还原是无操作
+            for i in range(min(len(lines), n)):
+                lines[i] = _restore_codes(lines[i], prot[i][1])
             if m is not None:                         # 在线直连的缺口补齐模式
                 base, indices = m
                 for j, idx in enumerate(indices):

@@ -627,12 +627,13 @@ class PinWindow(QWidget):
         return pm
 
     def _fit_trans(self, p: QPainter, trans: str, rect: QRect, h0: int):
-        """译文排版预算：像素字号按原行高 0.72 起、逐 px 缩到下限 8，行数×
-        行进距必须完全放进 rect 才算适配（度量取画笔所在设备，与绘制同源）。
-        放不下返回 None，由调用方保留原文——这是“宁可不翻，不能丢内容”的出口。
+        """译文排版预算：像素字号按原行高 0.80 起（用户实测 0.72 偏小）、
+        逐 px 缩到下限 8，行数×行进距必须完全放进 rect 才算适配（度量取
+        画笔所在设备，与绘制同源）。放不下返回 None，由调用方保留原文——
+        这是“宁可不翻，不能丢内容”的出口。
         """
         w = max(8, rect.width())
-        size = max(8, int(round(h0 * 0.72)))
+        size = max(8, int(round(h0 * 0.80)))
         while True:
             f = QFont(_tr_family())
             f.setPixelSize(size)
