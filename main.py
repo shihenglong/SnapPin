@@ -1,4 +1,4 @@
-"""SnapPin — PixPin 风格截图贴图工具（开源复刻 MVP）。
+﻿"""SnapPin — PixPin 风格截图贴图工具（开源复刻 MVP）。
 
 用法: pythonw main.py
 快捷键: Ctrl+1 截图 · Ctrl+Alt+V 剪贴板贴图 · Alt+2 关闭全部贴图 · Ctrl+Shift+2 隐藏/显示
@@ -21,14 +21,15 @@ if sys.stderr is None:            # pythonw/打包 exe 无控制台：重定向�
 if sys.stderr is not None:
     faulthandler.enable()         # 崩溃栈也会写进日志
 
-from PySide6.QtCore import QObject, QRect, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QDesktopServices, QIcon, QPixmap
+from PySide6.QtCore import QObject, QRect, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QIcon, QPixmap
 from PySide6.QtWidgets import (QApplication, QMenu, QMessageBox,
                                QSystemTrayIcon)
 
 import config
+import updater
 from icons import APP_ICON_SVG
-from hotkeys import HotkeyManager
+from hotkeys import HotkeyManager, combo_key, split_combos
 from ocr import OcrRunner, available as ocr_available
 from translate import TranslateClient
 
@@ -127,36 +128,68 @@ class App:
             config.cleanup_old_shots(self.cfg["capture"].get("retention_days", 30))
         # 启动气泡：常驻应用每次启动给一次存在感提示（热键取实际配置）
         self.tray.showMessage("SnapPin 已启动",
-                              f"{self.cfg['hotkeys']['capture']} 截图 · "
-                              f"{self.cfg['clip'].get('hotkey', 'Alt+V')} 剪贴板历史 · "
+                              f"{self._hk_text(self.cfg['hotkeys'].get('capture'))} 截图 · "
+                              f"{self._hk_text(self.cfg['clip'].get('hotkey'))} 剪贴板历史 · "
                               f"双击托盘打开设置",
                               QSystemTrayIcon.Information, 2500)
-        # 更新检查：启动 12s 后静默查一次 GitHub Releases（可在设置关闭）
-        self._upd_url = None
+        # 更新：启动 12s 后静默检查；发现新版自动后台下载，完成后气泡一键更新
+        self._upd_ready = None
         self._relay = _Relay()
         self._relay.fire.connect(self._on_update_status)
+        self._upd_flow = updater.UpdateFlow()
+        self._upd_flow.subscribe(lambda k, p: self._relay.fire.emit((k, p)),
+                                 replay=False)
         if self.cfg["system"].get("check_updates", True):
             QTimer.singleShot(12_000, self._check_updates_silent)
 
     # ------------------------------------------------ 检查更新
     def _check_updates_silent(self):
-        import updater
-        updater.check_async(lambda s, p: self._relay.fire.emit((s, p)))
+        self._upd_flow.start()
 
     def _on_update_status(self, pair):
         status, payload = pair
-        if status != "update":
-            return                            # 启动静默检查：仅发现新版才打扰
-        info = payload
-        self._upd_url = info["url"]
-        self.tray.showMessage(f"SnapPin 发现新版本 {info['tag']}",
-                              "点击此气泡打开下载页（也可在 设置→关于 手动检查）",
-                              QSystemTrayIcon.Information, 8000)
+        if status == "update":
+            if payload.get("can_install"):
+                msg = "正在后台下载，完成后可一键更新"
+            else:
+                msg = "当前为源码运行，可到设置→关于 查看"
+            self.tray.showMessage(f"SnapPin 发现新版本 {payload['tag']}", msg,
+                                  QSystemTrayIcon.Information, 5000)
+        elif status == "downloaded":
+            self._upd_ready = payload
+            self.tray.showMessage(
+                f"SnapPin {payload['tag']} 已下载完成",
+                "点击此气泡立即更新并重启（也可在 设置→关于 点「立即更新」）",
+                QSystemTrayIcon.Information, 10000)
+        # downloading / latest / error：启动检查保持静默，不打扰
+
+    def _prompt_update(self):
+        ready = self._upd_ready
+        if not ready:
+            return
+        parent = self.qapp.activeWindow()
+        box = QMessageBox(parent)
+        box.setWindowTitle("更新已就绪")
+        box.setText(f"SnapPin {ready['tag']} 已下载完成"
+                    f"（{ready['size'] / 1048576:.0f} MB）。")
+        box.setInformativeText("点「立即更新」会退出程序、替换文件并自动重新启动。")
+        ok = box.addButton("立即更新", QMessageBox.AcceptRole)
+        box.addButton("稍后", QMessageBox.RejectRole)
+        box.setDefaultButton(ok)
+        box.exec()
+        if box.clickedButton() is not ok:
+            return
+        try:
+            config.save(self.cfg)
+            self._upd_flow.install()
+        except Exception as exc:
+            QMessageBox.warning(parent, "无法自动更新", str(exc))
+            return
+        QTimer.singleShot(300, self.quit)
 
     def _on_tray_message_clicked(self):
-        if self._upd_url:
-            QDesktopServices.openUrl(QUrl(self._upd_url))
-            self._upd_url = None
+        if self._upd_ready:
+            self._prompt_update()
 
     @staticmethod
     def _warm_modules():
@@ -187,12 +220,12 @@ class App:
             "QMenu{background:white;border:1px solid #E5E6EB;border-radius:8px;padding:4px;}"
             "QMenu::item{padding:6px 30px;border-radius:5px;}"
             "QMenu::item:selected{background:#EAF2FF;color:#2E7CF6;}")
-        act_shot = QAction(f"截图 ({self.cfg['hotkeys']['capture']})", menu)
+        act_shot = QAction(f"截图 ({self._hk_text(self.cfg['hotkeys'].get('capture'))})", menu)
         act_pin = QAction("贴图（剪贴板）", menu)
         act_hide = QAction("隐藏/显示贴图", menu)
         act_close = QAction("关闭所有贴图", menu)
         act_clip = QAction(
-            f"剪贴板历史 ({self.cfg['clip'].get('hotkey', 'Alt+V')})", menu)
+            f"剪贴板历史 ({self._hk_text(self.cfg['clip'].get('hotkey'))})", menu)
         self._act_shot, self._act_clip = act_shot, act_clip
         act_pw = QAction("密码管理", menu)
         act_settings = QAction("设置…", menu)
@@ -231,28 +264,46 @@ class App:
     _HK_NAMES = {HK_CAPTURE: "截图", HK_PIN: "剪贴板贴图", HK_CLOSE: "关闭所有贴图",
                  HK_HIDE: "隐藏/显示贴图", HK_CLIP: "剪贴板历史"}
 
+    @staticmethod
+    def _hk_text(value) -> str:
+        """热键展示文本：取首个组合（未配置时给「未设置」）。"""
+        parts = split_combos(value)
+        return parts[0] if parts else "未设置"
+
     def _start_hotkeys(self):
         hk = self.cfg["hotkeys"]
-        combos = {HK_CAPTURE: hk["capture"], HK_PIN: hk["pin_clipboard"],
-                  HK_CLOSE: hk["close_all_pins"], HK_HIDE: hk["hide_show_pins"],
-                  HK_CLIP: self.cfg["clip"].get("hotkey", "Alt+V")}
-        # 同一组合分给多个功能时，后注册的必然失败 → 提前剔除并提示
-        seen = set()
-        for hid in list(combos):
-            c = combos[hid]
-            if c in seen:
-                self._queue_hk_fail(f"{self._HK_NAMES[hid]}（{c} 与其他功能重复）")
-                del combos[hid]
-            else:
-                seen.add(c)
+        raw = {HK_CAPTURE: hk.get("capture", ""),
+               HK_PIN: hk.get("pin_clipboard", ""),
+               HK_CLOSE: hk.get("close_all_pins", ""),
+               HK_HIDE: hk.get("hide_show_pins", ""),
+               HK_CLIP: self.cfg["clip"].get("hotkey", "")}
+        # 每个功能可绑两个组合：逐组合校验，非法 / 与已占用组合重复的剔除并提示
+        combos, owner = {}, {}
+        for hid, value in raw.items():
+            name = self._HK_NAMES[hid]
+            keep = []
+            for combo in split_combos(value):
+                key = combo_key(combo)
+                if key is None:
+                    self._queue_hk_fail(f"{name}（{combo}）无法识别，已跳过")
+                    continue
+                if key in owner:
+                    if owner[key] == hid:
+                        continue            # 同一功能填了重复组合：静默去重
+                    self._queue_hk_fail(f"{name}（{combo}）与其他功能重复，已跳过")
+                    continue
+                owner[key] = hid
+                keep.append(combo)
+            combos[hid] = keep
         self.hotkeys = HotkeyManager(combos)
         self.hotkeys.triggered.connect(self._on_hotkey)
         self.hotkeys.registration_failed.connect(self._hk_failed)
 
-    def _hk_failed(self, hk_id):
+    def _hk_failed(self, hk_id, combo=""):
+        tail = f"（{combo}）" if combo else ""
         self._queue_hk_fail(
-            f"{self._HK_NAMES.get(hk_id, f'#{hk_id}')} 注册失败（可能被其他软件占用），"
-            f"可在 设置→快捷键 修改")
+            f"{self._HK_NAMES.get(hk_id, f'#{hk_id}')}{tail}注册失败"
+            f"（可能被其他软件占用），可在 设置→快捷键 修改")
 
     def _queue_hk_fail(self, text: str):
         self._hk_fail_pending.append(text)
@@ -409,13 +460,16 @@ class App:
         self._overlay = CaptureOverlay(screen, self.cfg)
         self._overlay.setAttribute(Qt.WA_DeleteOnClose, True)
         self._overlay.sig_pin.connect(self._on_pin)
-        self._overlay.sig_saved.connect(
-            lambda p: self.tray.showMessage("SnapPin", f"已保存 {p}", QSystemTrayIcon.Information, 3000))
+        self._overlay.sig_pin_translate.connect(self._on_pin_translate)
+        # 自动/手动保存不再弹托盘气泡（用户反馈太烦）；复制后显式落库一次，
+        # 不依赖 dataChanged——抑制残留可能吞掉、50ms 合并可能晚于窗口关闭
+        if self.clip_monitor is not None:
+            self._overlay.sig_copied.connect(self.clip_monitor.capture_now)
         self._overlay.sig_cancelled.connect(lambda: setattr(self, "_overlay", None))
         self._overlay.destroyed.connect(lambda: setattr(self, "_overlay", None))
         self._overlay.start()
 
-    def _on_pin(self, pix: QPixmap, glob: QRect):
+    def _on_pin(self, pix: QPixmap, glob: QRect, translate: bool = False):
         try:
             from pinwin import PinWindow
             op = self.cfg["pin"].get("opacity", 100) / 100.0
@@ -424,9 +478,16 @@ class App:
             w.setWindowOpacity(op)
             if self._pins_hidden:
                 w.hide()
+            if translate:
+                # 钉图即翻译：取字还在跑时 translate_replace 自己等 OCR 完成后重试
+                w.translate_replace()
         except Exception:
             import traceback
             traceback.print_exc()
+
+    def _on_pin_translate(self, pix: QPixmap, glob: QRect):
+        """工具栏「钉图并翻译」：先钉到桌面，再立即开始整图翻译。"""
+        self._on_pin(pix, glob, translate=True)
 
     def pin_clipboard(self):
         cb = QApplication.clipboard()
@@ -484,9 +545,10 @@ class App:
         self._start_hotkeys()
         self._apply_clip_settings()
         # 托盘菜单文案与换过的热键保持一致
-        self._act_shot.setText(f"截图 ({self.cfg['hotkeys']['capture']})")
+        self._act_shot.setText(
+            f"截图 ({self._hk_text(self.cfg['hotkeys'].get('capture'))})")
         self._act_clip.setText(
-            f"剪贴板历史 ({self.cfg['clip'].get('hotkey', 'Alt+V')})")
+            f"剪贴板历史 ({self._hk_text(self.cfg['clip'].get('hotkey'))})")
         self.tray.showMessage("SnapPin", "设置已保存", QSystemTrayIcon.Information, 2000)
 
     def quit(self):

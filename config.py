@@ -1,4 +1,4 @@
-"""SnapPin 配置持久化 — 参照 PixPin 的配置结构。"""
+﻿"""SnapPin 配置持久化 — 参照 PixPin 的配置结构。"""
 import json
 import os
 import sys
@@ -17,6 +17,7 @@ CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 
 DEFAULTS = {
     "hotkeys": {
+        # 每个功能可绑两个组合：写成 "Ctrl+1, Ctrl+Alt+1"（第二个可省略）
         "capture": "Ctrl+1",          # 截图
         "close_all_pins": "Alt+2",    # 关闭所有贴图窗口
         "hide_show_pins": "Ctrl+Shift+2",  # 隐藏/显示所有贴图
@@ -27,6 +28,7 @@ DEFAULTS = {
         "border_width": 3,          # 选区边框宽度
         "show_hint": True,          # 显示快捷键提示面板
         "last_color": "#2E7CF6",    # 记住上次画笔颜色
+        "line_width": 3,            # 记住上次线条粗细（1-10，值=像素宽）
         "autosave": False,          # 截图完成后自动保存
         "retention_days": 30,       # 自动保存保留天数（0=永久）
         "corner_radius": 8,         # 截图圆角半径（0=直角）
@@ -51,7 +53,7 @@ DEFAULTS = {
     # === clip/pwman 挂载点：剪贴板历史 + 密码管理 ===
     "clip": {
         "enabled": True,           # 复制即自动记录
-        "hotkey": "Alt+V",         # 打开剪贴板历史
+        "hotkey": "Alt+V",         # 打开剪贴板历史（可写 "Alt+V, Ctrl+Alt+V"）
         "db_path": "",             # 空 = %APPDATA%/SnapPin/clip.db
         "popup_pos": "cursor",     # cursor / center / remember
         "pin_stay": False,         # 锁定状态：粘贴后窗口保持打开

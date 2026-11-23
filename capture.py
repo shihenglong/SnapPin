@@ -1,4 +1,4 @@
-"""截图覆盖层 — 暗化遮罩 + 窗口吸附 + 选区 + PixPin 风格工具栏 + 标注。"""
+﻿"""截图覆盖层 — 暗化遮罩 + 窗口吸附 + 选区 + PixPin 风格工具栏 + 标注。"""
 import ctypes
 import math
 import os
@@ -9,25 +9,57 @@ import time
 import numpy as np
 from ctypes import wintypes
 
-from PySide6.QtCore import (QMimeData, QPoint, QRect, QRectF, QSize, Qt, QTimer,
-                            QUrl, Signal)
+from PySide6.QtCore import (QEvent, QMimeData, QPoint, QRect, QRectF, QSize, Qt,
+                            QTimer, QUrl, Signal)
 from PySide6.QtGui import (QBrush, QColor, QCursor, QFont, QImage,
                            QMovie, QPolygon, QRegion,
                            QKeySequence, QPainter, QPainterPath, QPen, QPixmap,
                            QShortcut)
 from PySide6.QtWidgets import (QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QMessageBox, QPushButton,
-                               QScrollArea, QTextEdit, QToolButton, QVBoxLayout,
+                               QScrollArea, QSlider, QTextEdit, QToolButton, QToolTip, QVBoxLayout,
                                QWidget, QGraphicsDropShadowEffect)
 
 from icons import icon
+import clipimg
 import longshot_pixpin
 
 ACCENT = "#2E7CF6"
 _COLORS = ["#F53F3F", "#00B42A", "#2E7CF6", "#FF7D00", "#1D2129", "#FFFFFF", "#F7BA1E", "#7B61FF"]
 _DRAW_TOOLS = ("rect", "line", "arrow", "ellipse", "pen", "marker", "mosaic")
+# 线条粗细：滑块值即像素宽（1:1 线性），只作用于形状/画笔类工具
+_WIDTH_TOOLS = ("rect", "line", "arrow", "ellipse", "pen")
+_WIDTH_MIN, _WIDTH_MAX = 1, 10
+_WIDTH_DEFAULT = 3
+
+
+def _clamp_width(v, default=_WIDTH_DEFAULT):
+    """粗细小工具：配置被手改成非数字/越界时退回默认，不让截图整体崩。"""
+    try:
+        return max(_WIDTH_MIN, min(_WIDTH_MAX, int(v)))
+    except (TypeError, ValueError):
+        return default
 
 user32 = ctypes.windll.user32
 dwmapi = ctypes.windll.dwmapi
+
+_WDA_EXCLUDEFROMCAPTURE = 0x11      # SetWindowDisplayAffinity：窗口不进抓屏结果
+
+
+def _exclude_from_capture(widget, on: bool = True) -> bool:
+    """把窗口从屏幕抓取里剔除（屏幕照常显示，BitBlt/DWM 抓帧里没有）。
+
+    长截图 = 定时抓屏 + 拼接：自己的预览窗只要压在选区上，就会被原样拼进
+    长图（用户看到的「小水印」）。剔除后不再需要靠摆位置躲。
+    只对**顶层窗口**生效——有 parent 的 QWidget 是子窗口，系统直接返回
+    失败（实测），调用方仍需自行保证它不压在选区里。Win10 2004+ 才有此
+    标志，老系统返回 False，退回位置约束。"""
+    try:
+        return bool(user32.SetWindowDisplayAffinity(
+            wintypes.HWND(int(widget.winId())),
+            _WDA_EXCLUDEFROMCAPTURE if on else 0))
+    except Exception:
+        return False
+
 
 
 # ---------------------------------------------------------------- 工具栏
@@ -37,12 +69,15 @@ class CaptureToolbar(QWidget):
     action = Signal(str)
     _TOOLS_WITH_COLOR = ("rect", "line", "arrow", "ellipse", "pen", "marker",
                          "mosaic", "text", "serial")
+    # 工具名与图标名不同名的例外（icons 里翻译图标叫 nav_tr）
+    _ICON_ALIAS = {"translate": "nav_tr"}
 
-    def __init__(self, parent=None, color="#2E7CF6"):
+    def __init__(self, parent=None, color="#2E7CF6", width=_WIDTH_DEFAULT):
         super().__init__(parent)
         self.setObjectName("capToolbar")
         self.setAttribute(Qt.WA_TranslucentBackground)
         self._color = color
+        self._width = _clamp_width(width)
         col = QVBoxLayout(self)
         col.setContentsMargins(4, 3, 4, 3)
         col.setSpacing(3)
@@ -53,7 +88,7 @@ class CaptureToolbar(QWidget):
         seq = ["rect", "ellipse", "line", "arrow", "pen", "marker", "text",
                "mosaic", "serial", "eraser", "sep",
                "undo", "redo", "sep",
-               "longshot", "gif", "pin", "close", "save", "copy"]
+               "longshot", "gif", "pin", "translate", "close", "save", "copy"]
         for name in seq:
             if name == "sep":
                 line = QWidget()
@@ -70,10 +105,11 @@ class CaptureToolbar(QWidget):
                     "serial": "标记序号（单击放置，序号自动递增）",
                     "eraser": "橡皮擦", "save": "保存", "close": "关闭 (Esc)",
                     "longshot": "长截图（滚动拼接，⇕ 可切横向）", "gif": "GIF 录制（选区固定，10fps）",
-                    "pin": "贴图 (Ctrl+D)", "copy": "截图并复制 (Enter)",
+                    "pin": "贴图 (Ctrl+D)", "translate": "贴图并翻译（识别文字后替换为译文）",
+                    "copy": "截图并复制 (Enter)",
                     "undo": "撤销 (Ctrl+Z)", "redo": "重做 (Ctrl+Y)"}
             b.setToolTip(tips.get(name, name))
-            b.setIcon(icon(name, "#4E5969", 20, 1.6))
+            b.setIcon(icon(self._ICON_ALIAS.get(name, name), "#4E5969", 20, 1.6))
             b.setProperty("tool", name)
             b.clicked.connect(lambda _=False, n=name: self.action.emit(n))
             row.addWidget(b)
@@ -94,6 +130,33 @@ class CaptureToolbar(QWidget):
             d.clicked.connect(lambda _=False, cc=c: self._pick(cc))
             crow.addWidget(d)
             self._dots[c] = d
+        # 线条粗细：色板右侧的 1-10 滑块（值=像素宽，线性），只对形状/画笔类显示
+        self.width_row = QWidget()
+        wrow = QHBoxLayout(self.width_row)
+        wrow.setContentsMargins(10, 0, 2, 0)
+        wrow.setSpacing(4)
+        self._wlabel = QLabel(str(self._width))
+        self._wlabel.setFixedWidth(14)
+        self._wlabel.setAlignment(Qt.AlignCenter)
+        self._wlabel.setStyleSheet("color:#4E5969;font-size:11px;")
+        self._slider = QSlider(Qt.Horizontal)
+        self._slider.setRange(_WIDTH_MIN, _WIDTH_MAX)
+        self._slider.setValue(self._width)
+        self._slider.setFixedSize(88, 16)
+        self._slider.setCursor(Qt.PointingHandCursor)
+        self._slider.setToolTip("线条粗细 1-10")
+        self._slider.setStyleSheet(
+            "QSlider{background:transparent;}"
+            "QSlider::groove:horizontal{height:4px;background:#E5E6EB;"
+            "border-radius:2px;}"
+            "QSlider::sub-page:horizontal{background:#2E7CF6;border-radius:2px;}"
+            "QSlider::handle:horizontal{width:12px;height:12px;margin:-6px 0;"
+            "background:white;border:2px solid #2E7CF6;border-radius:8px;}")
+        self._slider.valueChanged.connect(self._on_width)
+        wrow.addWidget(self._wlabel)
+        wrow.addWidget(self._slider)
+        self.width_row.hide()
+        crow.addWidget(self.width_row)
         crow.addStretch(1)
         col.addWidget(self.color_row)
         self.color_row.hide()
@@ -122,6 +185,20 @@ class CaptureToolbar(QWidget):
         self._color = c
         self._update_dots()
 
+    def _on_width(self, v):
+        self._width = _clamp_width(v)
+        self._wlabel.setText(str(self._width))
+        self.action.emit(f"width:{self._width}")
+
+    def set_current_width(self, w):
+        w = _clamp_width(w)
+        self._width = w
+        self._wlabel.setText(str(w))
+        if self._slider.value() != w:
+            self._slider.blockSignals(True)
+            self._slider.setValue(w)
+            self._slider.blockSignals(False)
+
     def _update_dots(self):
         for c, d in self._dots.items():
             ring = "#1D2129" if c == self._color else "transparent"
@@ -133,6 +210,7 @@ class CaptureToolbar(QWidget):
         for n, b in self._tool_buttons.items():
             b.setStyleSheet("background:#EAF2FF;" if n == name else "")
         self.color_row.setVisible(name in self._TOOLS_WITH_COLOR)
+        self.width_row.setVisible(name in _WIDTH_TOOLS)
         self.adjustSize()
 
 # ---------------------------------------------------------------- 长截图预览窗
@@ -321,6 +399,7 @@ class LongshotToolbar(QWidget):
     sig_copy = Signal()
     sig_finish = Signal()
     sig_pin = Signal()
+    sig_pin_translate = Signal()        # 钉图并翻译
 
     # 与 CaptureToolbar 同一套视觉：白底、同图标色、同 hover
     ICON_COLOR = "#4E5969"
@@ -367,6 +446,7 @@ class LongshotToolbar(QWidget):
             return b
 
         self.btn_pin = ibtn("pin", "钉到桌面")
+        self.btn_translate = ibtn("nav_tr", "钉到桌面并翻译")
         self.btn_close = ibtn("close", "取消长截图 (Esc)")
         self.btn_save = ibtn("save", "保存为图片")
         self.btn_copy = ibtn("copy", "复制到剪贴板")
@@ -375,8 +455,9 @@ class LongshotToolbar(QWidget):
             "QToolButton{border:none;border-radius:7px;background:#2E7CF6;}"
             "QToolButton:hover{background:#1E66E0;}"
             "QToolButton:pressed{background:#1A58C4;}")
-        # 按钮顺序与普通截图工具栏对齐（pin → close → save → copy）
-        for b in (self.btn_pin, self.btn_close, self.btn_save, self.btn_copy):
+        # 按钮顺序与普通截图工具栏对齐（pin → translate → close → save → copy）
+        for b in (self.btn_pin, self.btn_translate, self.btn_close,
+                  self.btn_save, self.btn_copy):
             row.addWidget(b)
         row.addWidget(self._sep())
         self.btn_dir = ibtn("dir_v", "切换到横向拼接")
@@ -389,6 +470,7 @@ class LongshotToolbar(QWidget):
         row.addWidget(self.btn_ok)
         # 按钮 → 信号（漏接这组 connect 就是「点击全部无效」的根因）
         self.btn_pin.clicked.connect(self.sig_pin.emit)
+        self.btn_translate.clicked.connect(self.sig_pin_translate.emit)
         self.btn_save.clicked.connect(self.sig_save.emit)
         self.btn_copy.clicked.connect(self.sig_copy.emit)
         self.btn_ok.clicked.connect(self.sig_finish.emit)
@@ -396,6 +478,9 @@ class LongshotToolbar(QWidget):
         self.btn_up.clicked.connect(lambda: self.sig_auto.emit(-1))
         self.btn_down.clicked.connect(lambda: self.sig_auto.emit(1))
         self.btn_close.clicked.connect(self.sig_close.emit)
+        # tooltip 抑制：按钮上的 ToolTip 事件在本窗口内被吞掉（见 eventFilter）
+        for w in [self] + self.findChildren(QToolButton):
+            w.installEventFilter(self)
         eff = QGraphicsDropShadowEffect(self)
         eff.setBlurRadius(18)
         eff.setOffset(0, 3)
@@ -418,6 +503,16 @@ class LongshotToolbar(QWidget):
         p.setBrush(QColor(255, 255, 255, 168))
         p.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 14, 14)
         p.end()
+
+    def eventFilter(self, obj, ev):
+        """长截图期间一律不弹 tooltip。
+
+        tooltip 是**独立顶层窗口**（不受覆盖层镂空 mask 约束），落在选区内
+        就会被定时抓帧拼进长图——用户看到的「小水印一样、写着什么滚动」
+        就是自动滚动按钮的提示气泡。图标按钮的语义改用状态标签/运行态表达。"""
+        if ev.type() == QEvent.ToolTip:
+            return True
+        return super().eventFilter(obj, ev)
 
     def _sep(self):
         w = QWidget(self)
@@ -747,7 +842,9 @@ class GifResult(QWidget):
 # ---------------------------------------------------------------- 覆盖层
 class CaptureOverlay(QWidget):
     sig_pin = Signal(QPixmap, QRect)
+    sig_pin_translate = Signal(QPixmap, QRect)     # 钉图并翻译
     sig_saved = Signal(str)
+    sig_copied = Signal()                          # 已复制到剪贴板（复制关闭/Enter）
     sig_cancelled = Signal()
 
     def __init__(self, screen, cfg, parent=None):
@@ -788,6 +885,9 @@ class CaptureOverlay(QWidget):
         self._drawing = None
         self._tool = None
         self._color = cfg.get("capture", {}).get("last_color", _COLORS[0])
+        self._width = _clamp_width(
+            cfg.get("capture", {}).get("line_width", _WIDTH_DEFAULT))
+        self._width_save_timer = None
         self._serial_no = 0
         self._press_pos = QPoint()
         self._outside_press = None   # 选区外按下点：松开无拖动=延伸该侧
@@ -873,7 +973,7 @@ class CaptureOverlay(QWidget):
     def toolbar(self):
         """工具栏首次用到（选中区域/切工具）时才创建：17 个 SVG 图标渲染不便宜。"""
         if self._toolbar is None:
-            self._toolbar = CaptureToolbar(self, color=self._color)
+            self._toolbar = CaptureToolbar(self, color=self._color, width=self._width)
             self._toolbar.action.connect(self._on_tool_action)
             self._toolbar.hide()
         return self._toolbar
@@ -1030,7 +1130,8 @@ class CaptureOverlay(QWidget):
                     self._begin_text(pos)
                     return
             if self._tool in _DRAW_TOOLS:
-                self._drawing = {"tool": self._tool, "pts": [pos], "color": self._color}
+                self._drawing = {"tool": self._tool, "pts": [pos],
+                                 "color": self._color, "width": self._width}
                 return
             if self._tool == "text":
                 self._begin_text(pos)
@@ -1072,6 +1173,8 @@ class CaptureOverlay(QWidget):
         self._finish("copy")
 
     def mouseMoveEvent(self, e):
+        if getattr(self, "_longshot", False) or getattr(self, "_gif", False):
+            return              # 选区冻结：拖动不改框、不换光标
         pos = e.pos()
         if self._outside_press is not None:
             # 选区外按住并拖动 → 转为重新框选（取消延伸意图）
@@ -1114,6 +1217,8 @@ class CaptureOverlay(QWidget):
     def mouseReleaseEvent(self, e):
         if e.button() != Qt.LeftButton:
             return
+        if getattr(self, "_longshot", False) or getattr(self, "_gif", False):
+            return              # 选区冻结：单击不再延伸该侧边框
         if self._outside_press is not None:
             p = self._outside_press
             self._outside_press = None
@@ -1246,6 +1351,12 @@ class CaptureOverlay(QWidget):
             print('TOOLBAR', x, y, tb.width(), tb.height(), ' '.join(btns), flush=True)
 
     # ------------------------------------------------ 工具动作
+    def _persist_width(self):
+        """滑块停手后落盘：记住上次线条粗细。"""
+        self._cfg.setdefault("capture", {})["line_width"] = self._width
+        import config
+        config.save(self._cfg)
+
     def _on_tool_action(self, name):
         if getattr(self, "_gif", False):
             if name == "gif":
@@ -1258,6 +1369,8 @@ class CaptureOverlay(QWidget):
                 self._save_longshot()      # 长截图另存为：选位置 → 保存 → 关闭
             elif name == "pin":
                 self._pin_longshot()       # 长图直接钉到桌面（自动缩放适配屏幕）
+            elif name == "translate":
+                self._pin_longshot(translate=True)
             elif name == "close":
                 self._cancel()
             return
@@ -1270,6 +1383,23 @@ class CaptureOverlay(QWidget):
             if self._anns and "color" in self._anns[-1]:
                 self._anns[-1]["color"] = self._color
                 self.update()
+            return
+        if name.startswith("width:"):
+            try:
+                w = _clamp_width(name.split(":", 1)[1])
+            except ValueError:
+                return
+            self._width = w
+            # 刚画完的形状立即换粗细（拖滑块时实时跟手）
+            if self._anns and self._anns[-1].get("tool") in _WIDTH_TOOLS:
+                self._anns[-1]["width"] = w
+                self.update()
+            # 滑块拖动会连发事件：400ms 无操作才落盘，避免每次移动都写配置
+            if self._width_save_timer is None:
+                self._width_save_timer = QTimer(self)
+                self._width_save_timer.setSingleShot(True)
+                self._width_save_timer.timeout.connect(self._persist_width)
+            self._width_save_timer.start(400)
             return
         if name in ("rect", "line", "arrow", "ellipse", "pen", "marker", "mosaic",
                     "text", "serial", "eraser"):
@@ -1290,6 +1420,8 @@ class CaptureOverlay(QWidget):
             return
         if name == "pin":
             self._finish("pin")
+        elif name == "translate":
+            self._finish("pin_translate")
         elif name == "copy":
             self._finish("copy")
         elif name == "save":
@@ -1377,8 +1509,7 @@ class CaptureOverlay(QWidget):
                 self.update()
                 return
 
-    @staticmethod
-    def _ann_bbox(ann):
+    def _ann_bbox(self, ann):
         if ann.get("rect"):
             return QRect(ann["rect"])
         pts = ann.get("pts", [])
@@ -1387,7 +1518,11 @@ class CaptureOverlay(QWidget):
         r = QRect(pts[0], pts[0])
         for pt in pts[1:]:
             r = r.united(QRect(pt, pt))
-        return r.adjusted(-14, -14, 14, 14)
+        # 命中区随线条变粗：粗线擦不到边缘会很难用
+        pad = 14
+        if ann.get("tool") in _WIDTH_TOOLS:
+            pad = max(pad, int(ann.get("width", self._width)) + 8)
+        return r.adjusted(-pad, -pad, pad, pad)
 
     def _paint_annotations(self, p: QPainter):
         for ann in self._anns:
@@ -1399,66 +1534,79 @@ class CaptureOverlay(QWidget):
         tool = ann["tool"]
         pts = ann.get("pts", [])
         color = QColor(ann.get("color", self._color))
+        w = _clamp_width(ann.get("width", self._width))
         p.setRenderHint(QPainter.Antialiasing, True)
-        if tool in ("pen", "marker", "mosaic") and len(pts) >= 2:
-            pen = QPen()
-            if tool == "pen":
-                pen = QPen(color, 3)
-            elif tool == "marker":
-                c = QColor(color)
-                c.setAlpha(110)
-                pen = QPen(c, 14)
-            else:
-                pen = QPen(QBrush(self.mosaic_img), 18)
-            pen.setCapStyle(Qt.RoundCap)
-            pen.setJoinStyle(Qt.RoundJoin)
-            p.setPen(pen)
-            p.setBrush(Qt.NoBrush)
-            p.drawPolyline(pts)
-        if tool in ("pen", "marker", "mosaic"):
-            return
-        if tool == "line" and len(pts) >= 2:
-            # 真直线：只取首尾两点（旧实现走拖拽轨迹点列，与手绘无异）
-            p.setPen(QPen(color, 3, Qt.SolidLine, Qt.RoundCap))
-            p.drawLine(pts[0], pts[-1])
-            return
-        if tool == "rect":
-            p.setPen(QPen(color, 3))
-            p.setBrush(Qt.NoBrush)
-            p.drawRect(QRect(pts[0], pts[-1]).normalized())
-        elif tool == "ellipse":
-            p.setPen(QPen(color, 3))
-            p.setBrush(Qt.NoBrush)
-            p.drawEllipse(QRect(pts[0], pts[-1]).normalized())
-        elif tool == "arrow" and len(pts) >= 2:
-            p.setPen(QPen(color, 3, Qt.SolidLine, Qt.RoundCap))
-            p.drawLine(pts[0], pts[-1])       # 箭杆也是真直线
-            a, b = pts[0], pts[-1]
-            ang = math.atan2(b.y() - a.y(), b.x() - a.x())
-            L = 14
-            for da in (math.pi * 5 / 6, -math.pi * 5 / 6):
-                p.drawLine(b, QPoint(int(b.x() + L * math.cos(ang + da)),
-                                     int(b.y() + L * math.sin(ang + da))))
-        elif tool == "text":
-            f = QFont("Microsoft YaHei", 14)
-            p.setFont(f)
-            p.setPen(QPen(color, 1))
-            r = ann.get("rect")
-            if r:
-                p.drawText(QRectF(r.adjusted(2, 2, -2, -2)),
-                           Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, ann.get("text", ""))
-            else:
-                p.drawText(QRect(pts[0], QSize(300, 300)), Qt.TextWordWrap, ann.get("text", ""))
-        elif tool == "serial":
-            f = QFont("Microsoft YaHei", 11, QFont.Bold)
-            p.setFont(f)
-            c = pts[0]
-            p.setPen(Qt.NoPen)
-            p.setBrush(QBrush(QColor(ann.get("color", ACCENT))))
-            p.drawEllipse(c, 11, 11)
-            p.setPen(QPen(Qt.white, 1))
-            p.drawText(QRect(c - QPoint(11, 11), QSize(22, 22)), Qt.AlignCenter,
-                       str(ann.get("num", 1)))
+        # 1px 描边落在整数坐标上，抗锯齿会把它摊到相邻两行各 50% 不透明 → 同一颜色
+        # 看着比 2/3px 浅一半。整体平移到像素中心，细线整格覆盖，颜色与粗线一致。
+        thin = w <= 1 and tool in _WIDTH_TOOLS
+        if thin:
+            p.save()
+            p.translate(0.5, 0.5)
+        try:
+            if tool in ("pen", "marker", "mosaic") and len(pts) >= 2:
+                pen = QPen()
+                if tool == "pen":
+                    pen = QPen(color, w)
+                elif tool == "marker":
+                    c = QColor(color)
+                    c.setAlpha(110)
+                    pen = QPen(c, 14)
+                else:
+                    pen = QPen(QBrush(self.mosaic_img), 18)
+                pen.setCapStyle(Qt.RoundCap)
+                pen.setJoinStyle(Qt.RoundJoin)
+                p.setPen(pen)
+                p.setBrush(Qt.NoBrush)
+                p.drawPolyline(pts)
+            if tool in ("pen", "marker", "mosaic"):
+                return
+            if tool == "line" and len(pts) >= 2:
+                # 真直线：只取首尾两点（旧实现走拖拽轨迹点列，与手绘无异）
+                p.setPen(QPen(color, w, Qt.SolidLine, Qt.RoundCap))
+                p.drawLine(pts[0], pts[-1])
+                return
+            if tool == "rect":
+                p.setPen(QPen(color, w))
+                p.setBrush(Qt.NoBrush)
+                p.drawRect(QRect(pts[0], pts[-1]).normalized())
+            elif tool == "ellipse":
+                p.setPen(QPen(color, w))
+                p.setBrush(Qt.NoBrush)
+                p.drawEllipse(QRect(pts[0], pts[-1]).normalized())
+            elif tool == "arrow" and len(pts) >= 2:
+                p.setPen(QPen(color, w, Qt.SolidLine, Qt.RoundCap))
+                p.drawLine(pts[0], pts[-1])       # 箭杆也是真直线
+                a, b = pts[0], pts[-1]
+                ang = math.atan2(b.y() - a.y(), b.x() - a.x())
+                L = max(14, int(round(w * 4)))    # 线越粗箭头越大，3px 时保持原尺寸
+                for da in (math.pi * 5 / 6, -math.pi * 5 / 6):
+                    p.drawLine(b, QPoint(int(b.x() + L * math.cos(ang + da)),
+                                         int(b.y() + L * math.sin(ang + da))))
+            elif tool == "text":
+                f = QFont("Microsoft YaHei", 14)
+                p.setFont(f)
+                p.setPen(QPen(color, 1))
+                r = ann.get("rect")
+                if r:
+                    p.drawText(QRectF(r.adjusted(2, 2, -2, -2)),
+                               Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap,
+                               ann.get("text", ""))
+                else:
+                    p.drawText(QRect(pts[0], QSize(300, 300)), Qt.TextWordWrap,
+                               ann.get("text", ""))
+            elif tool == "serial":
+                f = QFont("Microsoft YaHei", 11, QFont.Bold)
+                p.setFont(f)
+                c = pts[0]
+                p.setPen(Qt.NoPen)
+                p.setBrush(QBrush(QColor(ann.get("color", ACCENT))))
+                p.drawEllipse(c, 11, 11)
+                p.setPen(QPen(Qt.white, 1))
+                p.drawText(QRect(c - QPoint(11, 11), QSize(22, 22)), Qt.AlignCenter,
+                           str(ann.get("num", 1)))
+        finally:
+            if thin:
+                p.restore()
 
     # ------------------------------------------------ GIF 录制（选区固定，10fps）
     def _enter_gif(self):
@@ -1730,12 +1878,24 @@ class CaptureOverlay(QWidget):
         self._longshot = True
         self._tool = None
         self.toolbar.highlight_tool("longshot")
+        # 选区在长截图期间**冻结**：进模式前遗留的拖拽/移动态必须先清掉，
+        # 否则鼠标一动就按旧状态平移/缩放选区（用户实测「框选位置会变、
+        # 一变拼接就乱」）。鼠标事件本身也在 longshot 下直接吞掉。
+        self._selecting = False
+        self._outside_press = None
+        self._move_mode = None
+        self._drawing = None
+        self.setCursor(Qt.ArrowCursor)
         self._ls_reset_state()
         self._make_preview()
         # 长截图期间整个覆盖层镂空，只留选区边框和工具栏：
         # 选区外也恢复实时桌面（不再顶着进入长截图时的暗化快照），
         # 滚动页面时四周不会出现“背景被钉死”的割裂感；框选本身固定不动。
         self._refresh_ls_mask()
+        # 覆盖层整体从抓屏结果里剔除（子窗口一并生效，实测）：镂空之外的
+        # 边框、工具栏、尺寸标签都不会被抓住。漏掉任何一块都会变成
+        # 「长图里多出来的小水印」。老系统返回 False，退回镂空 mask。
+        _exclude_from_capture(self, True)
         if getattr(self, "_ls_timer", None) is None:
             # PixPin 用 100ms 定时器抓帧（0x14003E7FB / QTimer::start(timer,100)）；
             # 更快只会重复抓到同一画面，白白耗 CPU
@@ -1754,6 +1914,7 @@ class CaptureOverlay(QWidget):
         self._ls_start_timer.start(100)
         self.activateWindow()
         self.setFocus()
+        QToolTip.hideText()      # 进入前悬停留下的提示气泡会压在选区上被抓进长图
 
     def _ls_reset_state(self):
         self._ls_dir = "v"        # 拼接方向：v=上下滚动 / h=左右滚动
@@ -1767,6 +1928,9 @@ class CaptureOverlay(QWidget):
         self._ls_preview_t = 0.0
         self._ls_rejected = 0     # 未匹配丢弃的帧数（预览窗显示「拒 N 帧」）
         self._ls_miss = 0         # 连续「无新内容」计数（自动滚动判定到底用）
+        self._ls_auto_armed = False  # 自动滚动期间是否已把指针放到选区中心
+        # 冻结基准：进模式/切方向时以当前选区为准，之后任何路径都不得改框
+        self._ls_frozen_sel = QRect(self._sel)
         self._ls_conf = 0.0       # 最近一帧的匹配置信度
         self._pp = None           # longshot_pixpin.PixPinLongShot 引擎
 
@@ -1784,7 +1948,9 @@ class CaptureOverlay(QWidget):
         self._ls_auto_dir = 1 if direction >= 0 else -1
         self._ls_auto_last_len = self._ls_len
         self._ls_auto_stall = 0
+        self._ls_auto_armed = False   # 本次自动滚动是否已经动过指针（只动一次）
         self._ls_rejected = 0
+        QToolTip.hideText()      # 点按钮时的提示气泡不能留到整个自动滚动过程
         if getattr(self, "_ls_bar", None) is not None:
             self._ls_bar.set_auto(self._ls_auto_dir)
         if self._ls_auto_timer is None:
@@ -1793,26 +1959,65 @@ class CaptureOverlay(QWidget):
         self._ls_auto_timer.start()
         self._auto_scroll_step()
 
-    def _auto_scroll_step(self):
+    # 滚轮必须由**真实输入**驱动：Chromium 会直接丢弃 PostMessage/
+    # PostThreadMessage 送来的合成 WM_MOUSEWHEEL（实测滚动量 0，把窗口抬到
+    # 前台也一样），而真实输入的目标就是**指针下方的窗口**。所以指针必须
+    # 落在选区里，做法是：开启自动滚动时移动**一次**，把指针放到选区中心
+    # （用户要求的「截图中间」），之后全程不再移动、不再激活任何窗口，
+    # 每步就在指针原地注入滚轮——页面滚，鼠标不动。
+    def _ls_phys(self, pt: QPoint):
+        """覆盖层逻辑像素 → GetCursorPos/SetCursorPos 的物理像素。"""
+        dpr = getattr(self, "_dpr", 1.0) or 1.0
+        return int(round(pt.x() * dpr)), int(round(pt.y() * dpr))
+
+    def _ls_cursor_inside(self) -> bool:
+        """指针是否还在选区（物理像素 → 逻辑像素换算后判断）。"""
+        pt = wintypes.POINT()
+        if not user32.GetCursorPos(ctypes.byref(pt)):
+            return False
+        dpr = getattr(self, "_dpr", 1.0) or 1.0
         g = self._sel.translated(self._origin)
-        c = g.center()
+        return g.contains(QPoint(int(pt.x / dpr), int(pt.y / dpr)))
+
+    def _auto_scroll_step(self) -> bool:
+        """朝 _ls_auto_dir 滚一步；返回是否真的注入了滚轮。
+
+        指针被用户移出选区（去点停止/去做别的）时本步不注入，返回 False：
+        绝不把指针拽回来。"""
+        if not getattr(self, "_longshot", False):
+            return False
+        g = self._sel.translated(self._origin)
         # 步进按拼接轴视口减半（夹在 80~240）：固定 240 在小选区一步滚掉大半
         # 视口，重叠不足对齐必失败 → 自动滚动看着“滚了但一直拼不上”
         axis = g.width() if getattr(self, "_ls_dir", "v") == "h" else g.height()
         step = max(80, min(240, axis // 2))
         d = getattr(self, "_ls_auto_dir", 1)          # +1 下/右，-1 上/左
+        if getattr(self, "_ls_dir", "v") == "h":
+            msg, delta = 0x1000, step * d             # 横向滚轮：右正左负
+        else:
+            msg, delta = 0x0800, -step * d
+        if self._ls_cursor_inside():
+            self._ls_wheel(msg, delta)                # 就在指针原地滚
+            return True
+        if getattr(self, "_ls_auto_armed", False):
+            return False                             # 用户把鼠标移开了：不抢
+        cx, cy = self._ls_phys(g.center())
+        user32.SetCursorPos(cx, cy)                  # 全程唯一一次移动指针
+        self._ls_auto_armed = True
+        self._ls_wheel(msg, delta)
+        return True
+
+    def _ls_wheel(self, msg: int, delta: int):
         try:
-            user32.SetCursorPos(c.x(), c.y())
-            if getattr(self, "_ls_dir", "v") == "h":
-                user32.mouse_event(0x1000, 0, 0, step * d, 0)   # 横向滚轮：右正左负
-            else:
-                user32.mouse_event(0x0800, 0, 0, ((-step * d)) & 0xFFFFFFFF, 0)
+            user32.mouse_event(msg, 0, 0, delta & 0xFFFFFFFF, 0)
         except Exception:
             pass
 
     def _auto_tick(self):
         if not self._ls_auto:
             return
+        if getattr(self, "_ls_auto_armed", False) and not self._ls_cursor_inside():
+            return                          # 指针不在选区：暂停，不计「到底」
         if self._ls_len > self._ls_auto_last_len:
             # 上一步已经拼好，才滚下一步：避免“页面还没稳就继续滚”丢内容
             self._ls_auto_last_len = self._ls_len
@@ -1866,6 +2071,12 @@ class CaptureOverlay(QWidget):
         """
         if not self._longshot or self._ls_stitched is not None:
             return
+        # 占位提示（「滚动页面 / 开始拼接」）必须在**抓首帧之前**清掉：
+        # 预览窗压在选区上时，首帧会把这段文字当页面内容拼进长图头部，
+        # 而且它进了参考帧就再也去不掉（用户看到的「小水印」）。
+        if self._preview is not None:
+            self._preview.placeholder_off()
+        QToolTip.hideText()                   # 残留的按钮提示气泡同理
         frame = self._grab_frame_rgb()
         if frame is None:
             return
@@ -1877,8 +2088,6 @@ class CaptureOverlay(QWidget):
                          else np.ascontiguousarray(np.rot90(frame, k=-1)))
         self._ls_view = 0
         self._ls_miss = 0
-        if self._preview is not None:
-            self._preview.placeholder_off()
         self._update_preview(force=True)
 
     def _grab_region(self):
@@ -1947,6 +2156,12 @@ class CaptureOverlay(QWidget):
 """
         if not self._longshot or self._ls_stitched is None or self._ls_full:
             return
+        if getattr(self, "_ls_frozen_sel", None) is not None \
+                and self._sel != self._ls_frozen_sel:
+            # 兜底：抓帧区域一旦变了，位移匹配全部作废（用户实测「一变就异常」）。
+            # 选区的所有鼠标路径都已冻结，这里只防将来新增路径。
+            self._sel = QRect(self._ls_frozen_sel)
+            self._refresh_ls_mask()
         cur = self._grab_frame_rgb()
         if cur is None:
             return
@@ -1977,6 +2192,10 @@ class CaptureOverlay(QWidget):
         self._preview = LongshotPreview()
         self._update_preview()
         self._preview.show()
+        # 预览窗是**顶层窗口**，能进 SetWindowDisplayAffinity：把它从抓屏
+        # 结果里剔除。否则它压在选区上时会被抓帧原样拼进长图（用户看到的
+        # 「小水印」——半透明 22% 时尤其像水印）。剔除后屏幕照常显示。
+        _exclude_from_capture(self._preview, True)
         # 长截图专用工具栏：**独立顶层窗口**。挂在覆盖层下会受覆盖层镂空 mask
         # 裁切——工具栏宽度随尺寸标签变化，新长出来的按钮会被 mask 切掉
         # （用户看到「宽度不够、有按钮看不到」正是这个原因）。
@@ -1994,6 +2213,8 @@ class CaptureOverlay(QWidget):
             self._ls_bar.sig_copy.connect(self._finish_longshot)
             self._ls_bar.sig_finish.connect(self._finish_longshot)
             self._ls_bar.sig_pin.connect(self._pin_longshot)
+            self._ls_bar.sig_pin_translate.connect(
+                lambda: self._pin_longshot(translate=True))
         if self._toolbar is not None:
             self._toolbar.hide()
         self._ls_bar.set_dir(getattr(self, "_ls_dir", "v"))
@@ -2152,7 +2373,8 @@ class CaptureOverlay(QWidget):
             return
         # PixPin 没有「收尾补尾」：compose 每次都把整帧写进画布
         pix = self._longshot_pixmap()
-        QApplication.clipboard().setPixmap(pix)
+        clipimg.copy_image(pix)          # 只写无损格式（无 jpeg/webp）
+        self.sig_copied.emit()           # 主窗口显式落库剪贴板历史
         try:                                  # 诊断用：保留原始长图 PNG，便于核对
             path = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
                                 "SnapPin", "last_longshot.png")
@@ -2164,8 +2386,10 @@ class CaptureOverlay(QWidget):
         self._exit_longshot()
         self.close()
 
-    def _pin_longshot(self):
-        """把当前长图钉到桌面：PinWindow 会按屏幕大小自动缩放，滚轮可再缩放。"""
+    def _pin_longshot(self, translate: bool = False):
+        """把当前长图钉到桌面：PinWindow 会按屏幕大小自动缩放，滚轮可再缩放。
+
+        translate=True 时钉出后立即开始翻译（工具栏「钉图并翻译」）。"""
         if self._ls_stitched is None or self._ls_stitched.size == 0:
             self._exit_longshot()
             self.close()
@@ -2174,7 +2398,10 @@ class CaptureOverlay(QWidget):
         pix = self._longshot_pixmap()
         glob = self._sel.translated(self._origin)
         self._exit_longshot()
-        self.sig_pin.emit(pix, glob)
+        if translate:
+            self.sig_pin_translate.emit(pix, glob)
+        else:
+            self.sig_pin.emit(pix, glob)
         self.close()
 
     def _save_longshot(self):
@@ -2194,7 +2421,9 @@ class CaptureOverlay(QWidget):
             return                            # 用户取消：留在长截图模式
         if not os.path.splitext(path)[1]:
             path += ".png"
-        if not pix.save(path):
+        # JPEG 是唯一有损选项：显式给 100，别用 Qt 默认质量 75 把文字压糊
+        fmt = "JPEG" if os.path.splitext(path)[1].lower() in (".jpg", ".jpeg") else "PNG"
+        if not pix.save(path, fmt, 100 if fmt == "JPEG" else -1):
             QMessageBox.warning(self, "保存失败", f"无法写入：\n{path}")
             return
         self.sig_saved.emit(path)
@@ -2209,6 +2438,8 @@ class CaptureOverlay(QWidget):
                 self._ls_timer.stop()
             if getattr(self, "_ls_start_timer", None):
                 self._ls_start_timer.stop()
+            # 退出后覆盖层要重新参与抓屏：普通截图/贴图都可能把屏幕本身当素材
+            _exclude_from_capture(self, False)
             self.clearMask()
             if getattr(self, "_ls_bar", None) is not None:
                 self._ls_bar.hide()
@@ -2273,10 +2504,14 @@ class CaptureOverlay(QWidget):
             pix.save(path, "PNG")
             self.sig_saved.emit(path)
         if action == "copy":
-            QApplication.clipboard().setPixmap(pix)
+            clipimg.copy_image(pix)          # 只写无损格式（无 jpeg/webp）
+            self.sig_copied.emit()           # 主窗口显式落库剪贴板历史
             self.close()
         elif action == "pin":
             self.sig_pin.emit(pix, glob)
+            self.close()
+        elif action == "pin_translate":
+            self.sig_pin_translate.emit(pix, glob)
             self.close()
         elif action == "save":
             import os
@@ -2597,6 +2832,76 @@ if __name__ == "__main__":
     ov4._toggle_auto_scroll(-1)                    # 再点同方向：停止
     assert not ov4._ls_auto and not ov4._ls_auto_timer.isActive(), \
         "自动滚动应停止"
+
+    # ---- 自动滚动：指针只在开启时移动一次（到选区中心），之后全程不动
+    calls = []
+
+    class _FakeU32:
+        pos = (10, 10)
+
+        def GetCursorPos(self, ref):
+            ref._obj.x, ref._obj.y = self.pos
+            return 1
+
+        def SetCursorPos(self, x, y):
+            calls.append(("set", x, y))
+            self.pos = (x, y)
+            return 1
+
+        def mouse_event(self, msg, dx, dy, data, extra):
+            calls.append(("wheel", msg, data))
+
+    fake = _FakeU32()
+    real_u32 = user32
+    del ov4._auto_scroll_step            # 解除上面为验证计时器打的桩
+    globals()["user32"] = fake
+    try:
+        ov4._dpr = 1.0
+        ov4._ls_dir = "v"
+        ov4._ls_auto_dir = 1
+        ov4._ls_auto_armed = False
+        fake.pos = (10, 10)                        # 指针在选区外
+        assert ov4._auto_scroll_step() is True
+        assert calls == [("set", 189, 139),
+                         ("wheel", 0x0800, (-100) & 0xFFFFFFFF)], \
+            f"首次应把指针放进选区中心再注入滚轮: {calls}"
+        assert ov4._ls_auto_armed and fake.pos == (189, 139), \
+            f"指针应停在选区中心，实际 {fake.pos}"
+        calls.clear()
+        assert ov4._auto_scroll_step() is True     # 指针已在中心：就地滚
+        assert calls == [("wheel", 0x0800, (-100) & 0xFFFFFFFF)], \
+            f"之后每一步都不许再动指针: {calls}"
+        calls.clear()
+        fake.pos = (10, 10)                        # 用户自己把指针移走
+        assert ov4._auto_scroll_step() is False
+        assert calls == [] and fake.pos == (10, 10), \
+            f"指针被用户移走后不得拽回来: {calls} cursor={fake.pos}"
+        calls.clear()
+        fake.pos = (189, 139)
+        ov4._ls_dir = "h"                          # 横向：WM_MOUSEHWHEEL，右正左负
+        assert ov4._auto_scroll_step() is True
+        assert calls == [("wheel", 0x1000, 150)], f"向右应发正步长横向滚轮: {calls}"
+        ov4._ls_dir = "v"
+        ov4._ls_auto_armed = False
+    finally:
+        globals()["user32"] = real_u32
+
+    # ---- 长截图期间选区冻结：鼠标拖动/松开都不得改变框选（变了拼接就乱）
+    frozen = QRect(ov4._sel)
+    ov4._move_mode = "move"                        # 进模式前遗留的拖拽态
+    ov4.mouseMoveEvent(QMouseEvent(QEvent.MouseMove, QPointF(260, 200),
+                                   QPointF(260, 200), Qt.NoButton, Qt.LeftButton,
+                                   Qt.NoModifier))
+    ov4.mouseReleaseEvent(QMouseEvent(QEvent.MouseButtonRelease, QPointF(260, 200),
+                                      QPointF(260, 200), Qt.LeftButton,
+                                      Qt.LeftButton, Qt.NoModifier))
+    assert ov4._sel == frozen, f"长截图期间选区必须冻结: {ov4._sel}"
+    ov4._move_mode = None
+    ov4._sel = frozen.adjusted(0, 0, 30, 0)        # 假设有别的路径改了框
+    ov4._ls_step()
+    assert ov4._sel == frozen, f"抓帧前必须把选区还原成冻结值: {ov4._sel}"
+
+    assert ov4._ls_bar.eventFilter(ov4._ls_bar, QEvent(QEvent.ToolTip))
     # ---- 工具栏：全图标（无文字）+ 钉图按钮；预览窗加宽 + 穿透接口
     assert not ov4._ls_bar.btn_ok.text(), "完成按钮不应用文字"
     assert not ov4._ls_bar.btn_save.text(), "保存按钮不应用文字"

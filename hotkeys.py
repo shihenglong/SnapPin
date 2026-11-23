@@ -1,5 +1,10 @@
-"""全局热键 — RegisterHotKey + 独立消息循环线程。"""
+﻿"""全局热键 — RegisterHotKey + 独立消息循环线程。
+
+一个功能可绑定多个组合：配置值是 "Ctrl+1, Ctrl+Alt+1" 这样的字符串
+（也接受 list），由 split_combos() 拆分、HotkeyManager 逐组合注册。
+"""
 import ctypes
+import re
 from ctypes import wintypes
 
 from PySide6.QtCore import QObject, QThread, Signal
@@ -55,6 +60,22 @@ def parse_combo(text: str):
     return mods, vk
 
 
+def split_combos(value) -> list:
+    """配置值 → 组合列表：支持 "Ctrl+1"、"Ctrl+1, Ctrl+Alt+1" 或 list。"""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        parts = [str(v) for v in value]
+    else:
+        parts = re.split(r"[,;，；\n]+", str(value))
+    return [p.strip() for p in parts if p.strip()]
+
+
+def combo_key(text: str):
+    """"ctrl+1" / "Ctrl+1" 归一化成 (mods, vk) 供去重比对；无法解析返回 None。"""
+    return parse_combo(text or "")
+
+
 class _HotkeyThread(QThread):
     fired = Signal(int)       # hotkey id
     failed = Signal(int)      # hotkey id 注册失败
@@ -101,16 +122,44 @@ _PENDING = []  # stop() 超时未退出的旧 HotkeyManager，防运行中 QThre
 
 
 class HotkeyManager(QObject):
-    """combos: {id: "Ctrl+1"}；triggered(id) 在主线程发射。"""
+    """combos: {逻辑 id: "Ctrl+1" 或 "Ctrl+1, Ctrl+Alt+1"}。
+
+    一个功能可绑多个组合：每个组合用独立的系统热键 id 注册，
+    WM_HOTKEY 回来后统一翻回逻辑 id 再发 triggered()。
+    """
     triggered = Signal(int)
-    registration_failed = Signal(int)
+    registration_failed = Signal(int, str)      # (逻辑 id, 注册失败的组合)
+
+    _HK_ID_BASE = 100                           # 系统热键 id 起始值
 
     def __init__(self, combos, parent=None):
         super().__init__(parent)
-        self._thread = _HotkeyThread(list(combos.items()))
-        self._thread.fired.connect(self.triggered)
-        self._thread.failed.connect(self.registration_failed)
+        self._slots = {}                        # 系统热键 id → (逻辑 id, 组合)
+        plan = []
+        hk_id = self._HK_ID_BASE
+        for lid, value in combos.items():
+            seen = set()                        # 同一功能里重复填写的组合只注册一次
+            for combo in split_combos(value):
+                key = combo_key(combo)
+                if key is not None and key in seen:
+                    continue
+                seen.add(key)
+                self._slots[hk_id] = (lid, combo)
+                plan.append((hk_id, combo))
+                hk_id += 1
+        self._thread = _HotkeyThread(plan)
+        self._thread.fired.connect(self._on_fired)
+        self._thread.failed.connect(self._on_failed)
         self._thread.start()
+
+    def _on_fired(self, hk_id):
+        slot = self._slots.get(hk_id)
+        if slot is not None:
+            self.triggered.emit(slot[0])
+
+    def _on_failed(self, hk_id):
+        lid, combo = self._slots.get(hk_id, (hk_id, ""))
+        self.registration_failed.emit(lid, combo)
 
     def stop(self):
         """请求退出并等待；线程刚启动尚未记录 thread_id 时先等它就绪再投递退出消息。"""
@@ -149,6 +198,12 @@ if __name__ == "__main__":
     assert parse_combo("Shift+/") == (MOD_SHIFT, 0xBF)
     assert parse_combo("Ctrl+") is None
     assert parse_combo("nonsense") is None
+    # 双快捷键：配置值拆分与归一化去重
+    assert split_combos("Ctrl+1, Ctrl+Alt+1") == ["Ctrl+1", "Ctrl+Alt+1"]
+    assert split_combos("Ctrl+1；Alt+V\n F5 ") == ["Ctrl+1", "Alt+V", "F5"]
+    assert split_combos(["Ctrl+1", " "]) == ["Ctrl+1"]
+    assert split_combos(None) == [] and split_combos("") == []
+    assert combo_key("ctrl+1") == combo_key("Ctrl+1") != combo_key("Ctrl+Alt+1")
 
     app = QApplication(sys.argv)
 
@@ -162,12 +217,18 @@ if __name__ == "__main__":
         return False
 
     # ---- 换热键的关键链路：stop() 后同组合必须能立即重新注册（= 旧线程确实注销了）
-    combos = {11: "Ctrl+Alt+J", 12: "Ctrl+Alt+K", 13: "Ctrl+Alt+`"}
+    combos = {11: "Ctrl+Alt+J, Ctrl+Alt+K", 12: "Ctrl+Alt+`"}
     m1 = HotkeyManager(combos)
-    assert wait_registered(m1, [11, 12, 13]), "首次注册失败"
+    assert wait_registered(m1, [100, 101, 102]), "首次注册失败"
+    # 一个功能的第二个组合也必须路由回同一逻辑 id（系统 id 101 → 功能 11）
+    fired = []
+    m1.triggered.connect(fired.append)
+    m1._on_fired(101)
+    m1._on_fired(102)
+    assert fired == [11, 12], f"组合到功能的映射错误，实际 {fired}"
     m1.stop()
     m2 = HotkeyManager(combos)
-    ok = wait_registered(m2, [11, 12, 13])
+    ok = wait_registered(m2, [100, 101, 102])
     m2.stop()
     assert ok, "stop() 后同组合重新注册失败：旧热键未被注销（换键不生效根因）"
-    print("hotkeys 自测通过: 符号键 VK 映射 / stop 后重注册 全部 OK")
+    print("hotkeys 自测通过: 符号键 VK 映射 / 双快捷键路由 / stop 后重注册 全部 OK")

@@ -1,4 +1,4 @@
-"""Ditto 风格剪贴板历史快贴窗口 — 无边框置顶小窗（仿 Ditto 布局）。
+﻿"""Ditto 风格剪贴板历史快贴窗口 — 无边框置顶小窗（仿 Ditto 布局）。
 
 结构：细标题栏（计数）/ 编号列表（常用项以图钉替代序号）/ 底部搜索栏（••• 菜单）/
 右侧竖向工具栏（✕ 关闭 + 🔒 锁定 + 📌 常用 + 🔑 密码，空白双击锁定，底部锁定指示）。
@@ -8,6 +8,7 @@
 import os
 import time
 import ctypes
+import traceback
 from ctypes import wintypes
 
 from PySide6.QtCore import (QByteArray, QEvent, QMimeData, QPoint, QSize, Qt,
@@ -595,7 +596,7 @@ class ClipWindow(QWidget):
         num_lab.setProperty("num", True)
         num_lab.setFixedWidth(22)
         num_lab.setAlignment(Qt.AlignCenter)
-        if ci.pinned:  # 常用项：图钉替代序号
+        if ci.pinned:  # 常用项：图钉替代序号（只是免清理标记，排序仍按时间）
             num_lab.setPixmap(_svg_icon(_SVG_PIN, ACCENT, 14, 1.7).pixmap(14, 14))
         else:
             num_lab.setText(str(num))
@@ -688,6 +689,13 @@ class ClipWindow(QWidget):
             if not img.isNull():
                 md.setImageData(img)
         QApplication.clipboard().setMimeData(md)
+        # 使用过的条目置顶（相当于再次复制存入一份）；窗口开着就立刻重排可见
+        try:
+            self._store.touch(ci.id)
+        except Exception:
+            traceback.print_exc()
+        if self.isVisible():
+            self.refresh()
 
     def _paste(self, ci: ClipItem):
         if not isinstance(ci, ClipItem):
@@ -1168,9 +1176,7 @@ if __name__ == "__main__":
     win._set_mode("pw")
     assert win._mode == "all", "再点一次当前模式应返回全部"
 
-    # 清空历史（保留常用）
-    ci0 = win.list.item(0).data(Qt.UserRole)
-    win._set_pinned(ci0, True)
+    # 清空历史（保留常用）：上面设的常用项必须活下来，其余全部清空
     n = store.clear(keep_pinned=True)
     win.refresh()
     assert n >= 2 and win.list.count() == 1, "清空后应只剩常用项"
@@ -1181,7 +1187,7 @@ if __name__ == "__main__":
     win.popup()
     QApplication.clipboard().clear()
     sent.clear()
-    expect0 = win.list.item(0).data(Qt.UserRole).text  # 行0 = 置顶常用项
+    expect0 = win.list.item(0).data(Qt.UserRole).text  # 行0 = 最新条目（常用项不置顶）
     win._kb_paste(0)
     t0 = time.time()
     while time.time() - t0 < 0.4:
@@ -1201,13 +1207,16 @@ if __name__ == "__main__":
 
     win.popup()
     QApplication.clipboard().clear()
+    win._last_paste = 0            # 清掉 0.3s 防呆，确保这次真的粘贴
     from PySide6.QtGui import QKeyEvent
+    want0 = win.list.item(0).data(Qt.UserRole).text   # 搜索框回车 = 贴当前行
     win.eventFilter(win.search, QKeyEvent(QEvent.KeyPress, Qt.Key_Return, Qt.NoModifier))
     t0 = time.time()
     while time.time() - t0 < 0.4:
         app.processEvents()
         time.sleep(0.01)
-    assert QApplication.clipboard().text() == expect0, "搜索框回车应粘贴首行"
+    assert QApplication.clipboard().text() == want0, (
+        f"搜索框回车应粘贴首行, 实际 {QApplication.clipboard().text()!r} / 期望 {want0!r}")
 
     n0 = win.list.count()
     win._kb_delete(0)

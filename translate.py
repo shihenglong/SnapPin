@@ -1,8 +1,7 @@
-"""翻译 — 参考 evan-ocr 的双轨方案：免 Key 在线直连（多通道容灾）+ 离线引擎。
+﻿"""翻译 — 参考 evan-ocr 的双轨方案：免 Key 在线直连（多通道容灾）+ 离线引擎。
 
-在线直连（默认，开箱即用）：Google GTX 直连 + MyMemory 容灾，逐块并发、
-  单块双通道都失败时自动转离线引擎补齐；
-Ollama（本地大模型）：自动连接本机 Ollama（http://localhost:11434），
+在线直连（默认，开箱即用）：必应（Edge 内置翻译接口，免 Key）→ Google GTX
+  → MyMemory 三通道容灾，逐块并发、前一路径拿不到即降级，三路全败的块转离线引擎补齐；
   模型自动检测（优先 Qwen/DeepSeek），不可用自动转离线引擎；
 GLM / MiniMax / 自定义 OpenAI 兼容：一次请求批量翻译全部文字块；
 离线插件：CTranslate2 神经引擎 + OPUS-MT int8 模型（vendor/plugins/translation，
@@ -144,6 +143,9 @@ _OLLAMA_HOST = "http://localhost:11434"
 _OLLAMA_PREFS = ("qwen", "deepseek", "glm")   # 模型自动检测优先级
 _TIMEOUT_MS = 20_000
 _ONLINE_TIMEOUT_MS = 8_000
+# 必应（Edge 内置翻译接口）：免 Key、无需 token，POST 字符串数组；from 留空 = 自动识别源语言。
+# 非公开端点，微软调整后由后续通道（GTX / MyMemory / 离线）自动兜底。
+_BING_URL = "https://edge.microsoft.com/translate/translatetext?from=&isEnterpriseClient=false"
 _OLLAMA_TIMEOUT_MS = 120_000
 
 
@@ -213,7 +215,7 @@ class TranslateClient(QObject):
         tc = self._cfg.get("translate", {})
         engine = tc.get("engine", "online")
         if engine == "online":
-            return True, "在线直连 · 免 Key（GTX + MyMemory 多通道容灾）"
+            return True, "在线直连 · 免 Key（必应 + GTX + MyMemory 多通道容灾）"
         if engine == "ollama":
             base = tc.get("api_base") or _OLLAMA_HOST
             return True, f"Ollama 本地大模型 · {base}（模型自动检测）"
@@ -267,20 +269,25 @@ class TranslateClient(QObject):
 
     # ------------------------------------------------ 在线直连（免 Key 多通道）
     def _online_translate(self, texts: list, target: str, tag: int):
-        """逐块并发：Google GTX → MyMemory 双通道容灾；全败块转离线插件补齐。"""
+        """逐块并发：必应 → Google GTX → MyMemory 三通道容灾；全败块转离线插件补齐。"""
         st = {"texts": list(texts), "results": ["" for _ in texts],
-              "pending": len(texts), "target": target}
+              "pending": len(texts), "target": target,
+              "channels": [None for _ in texts]}     # 每块最终命中的通道号
         self._online_state[tag] = st
         for i in range(len(texts)):
             self._online_req(st, tag, i, 0)
 
     def _online_req(self, st: dict, tag: int, i: int, stage: int):
         text = st["texts"][i]
-        if stage == 0:      # 通道一：Google GTX 直连
+        body = None
+        if stage == 0:      # 通道一：必应（Edge 内置接口，免 Key，from 留空 = 自动识别）
+            url = QUrl(f"{_BING_URL}&to={urllib.parse.quote(st['target'])}")
+            body = json.dumps([text], ensure_ascii=False).encode("utf-8")
+        elif stage == 1:    # 通道二：Google GTX 直连
             qs = urllib.parse.urlencode({"client": "gtx", "sl": "auto",
                                          "tl": st["target"], "dt": "t", "q": text})
             url = QUrl(f"https://translate.googleapis.com/translate_a/single?{qs}")
-        else:               # 通道二：MyMemory 容灾
+        else:               # 通道三：MyMemory 容灾
             src = self._guess_src(text)
             qs = urllib.parse.urlencode({"q": text, "langpair": f"{src}|{st['target']}"})
             url = QUrl(f"https://api.mymemory.translated.net/get?{qs}")
@@ -288,7 +295,8 @@ class TranslateClient(QObject):
         req.setAttribute(QNetworkRequest.RedirectPolicyAttribute,
                          QNetworkRequest.NoLessSafeRedirectPolicy)
         req.setTransferTimeout(_ONLINE_TIMEOUT_MS)
-        reply = self._nam.get(req)
+        req.setHeader(QNetworkRequest.ContentTypeHeader, "application/json")
+        reply = self._nam.post(req, body) if body is not None else self._nam.get(req)
         self._pending += 1
 
         def _fin(r=reply, s=stage):
@@ -297,11 +305,12 @@ class TranslateClient(QObject):
             data = bytes(r.readAll()) if err == QNetworkReply.NoError else b""
             r.deleteLater()
             if err == QNetworkReply.NoError:
-                out = self._gtx_parse(data) if s == 0 else self._mymemory_parse(data)
+                out = self._ONLINE_PARSERS[s](data)
                 if out:
                     st["results"][i] = out
-            if not st["results"][i] and s == 0:
-                self._online_req(st, tag, i, 1)     # GTX 失败 → MyMemory 容灾
+                    st["channels"][i] = s
+            if not st["results"][i] and s + 1 < len(self._ONLINE_PARSERS):
+                self._online_req(st, tag, i, s + 1)  # 本通道拿不到 → 下一通道
                 return
             st["pending"] -= 1
             if st["pending"] <= 0:
@@ -313,12 +322,29 @@ class TranslateClient(QObject):
         self._online_state.pop(tag, None)
         missing = [i for i, r in enumerate(st["results"]) if not r.strip()]
         if missing and local_available():
-            # 双通道都拿不到的块 → 离线插件补齐后按序合并
+            # 三通道都拿不到的块 → 离线插件补齐后按序合并
             self._local_translate([st["texts"][i] for i in missing], st["target"], tag,
                                   merge=(st["results"], missing))
         else:
-            self.last_engine = "在线直连"
+            self.last_engine = self._engine_label(st["channels"])
             self.done.emit(st["results"], tag)
+
+    @staticmethod
+    def _engine_label(channels: list) -> str:
+        """本次用到的通道集合 → 提示文案（单通道只写通道名，否则列出容灾通道）。"""
+        names = ["必应", "Google", "MyMemory"]
+        used = [names[c] for c in sorted({c for c in channels if c is not None})]
+        if not used:
+            return "在线直连"
+        return used[0] if len(used) == 1 else f"在线直连（{' + '.join(used)}）"
+
+    @staticmethod
+    def _bing_parse(data: bytes) -> str:
+        """必应响应 [{"translations": [{"text": "译", "to": "zh-Hans", ...}]}] → 译文。"""
+        try:
+            return (json.loads(data.decode("utf-8"))[0]["translations"] or [{}])[0].get("text", "").strip()
+        except Exception:
+            return ""
 
     @staticmethod
     def _gtx_parse(data: bytes) -> str:
@@ -338,6 +364,8 @@ class TranslateClient(QObject):
         except Exception:
             pass
         return ""
+    # 在线通道表：下标 = 通道号（_online_req 按 0 → 1 → 2 依次降级）
+    _ONLINE_PARSERS = (_bing_parse, _gtx_parse, _mymemory_parse)
 
     @staticmethod
     def _guess_src(text: str) -> str:
@@ -660,6 +688,17 @@ if __name__ == "__main__":
     assert TranslateClient._guess_src("hello world") == "en"
     assert TranslateClient._guess_src("你好世界") == "zh-CN"
     print("gtx / mymemory 解析与语种粗判自测通过")
+    bing = TranslateClient._bing_parse(
+        '[{"translations":[{"text":"\\u4f60\\u597d\\uff0c\\u4e16\\u754c","to":"zh-Hans",'
+        '"sentLen":{"srcSentLen":[11],"transSentLen":[5]}}]}]'.encode("utf-8"))
+    assert bing == "你好，世界", bing
+    assert TranslateClient._bing_parse(b'{"error":{"code":400}}') == ""
+    assert TranslateClient._bing_parse(b"[]") == ""
+    assert TranslateClient._bing_parse(b"") == ""
+    assert TranslateClient._engine_label([0, 0, 0]) == "必应"
+    assert TranslateClient._engine_label([0, 2, 0]) == "在线直连（必应 + MyMemory）"
+    assert TranslateClient._engine_label([None]) == "在线直连"
+    print("bing 解析 / 通道文案自测通过")
 
     if not local_available():
         print("本地插件不存在，跳过降级自测")
@@ -719,7 +758,7 @@ if __name__ == "__main__":
     c5.translate(["hi"], "zh-CN", tag=5)
     assert chat_calls == [("http://localhost:11434", "qwen3")], chat_calls
 
-    # 在线直连：真实网络请求（GTX 在本沙箱不可达 → MyMemory 容灾应命中）
+    # 在线直连：真实网络请求（默认应命中必应；必应不可达时后级通道兜底，只断言拿到译文）
     cfg2 = {"translate": {"engine": "online"}}
     c2 = TranslateClient(cfg2)
     got2, err2 = {}, []

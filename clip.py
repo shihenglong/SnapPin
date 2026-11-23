@@ -1,4 +1,4 @@
-"""剪贴板历史 — Ditto 风格：SQLite 存储 + 系统剪贴板监听（仅主线程使用，无需加锁）。"""
+﻿"""剪贴板历史 — Ditto 风格：SQLite 存储 + 系统剪贴板监听（仅主线程使用，无需加锁）。"""
 import hashlib
 import json
 import os
@@ -185,12 +185,12 @@ class ClipStore:
 
     # ------------------------------------------------ 读取
     def query(self, search: str = "", limit: int = 200) -> list[ClipItem]:
-        """常用置顶、其内按 ts 降序；search 对 text/html/files 大小写不敏感子串过滤。"""
+        """按时间倒序（常用项也在原位，不做置顶）；search 对 text/html/files 大小写不敏感子串过滤。"""
         rows = self._con.execute(
             "SELECT c.id, c.ts, c.pinned, c.text, c.html, c.files, c.source_app, c.size, "
             "c.thumb_png, GROUP_CONCAT(d.fmt) FROM clips c "
             "LEFT JOIN clip_data d ON d.clip_id = c.id "
-            "GROUP BY c.id ORDER BY c.pinned DESC, c.ts DESC").fetchall()
+            "GROUP BY c.id ORDER BY c.ts DESC, c.id DESC").fetchall()
         s = (search or "").lower()
         out = []
         for cid, ts, pinned, text, html, files, app, size, thumb, fmts in rows:
@@ -217,6 +217,11 @@ class ClipStore:
                 "files": json.loads(files) if files else []}
 
     # ------------------------------------------------ 管理
+    def touch(self, clip_id: int) -> None:
+        """使用过的条目置顶：只更新 ts，内容与去重 hash 不变（相当于再次复制）。"""
+        self._con.execute("UPDATE clips SET ts=? WHERE id=?", (time.time(), clip_id))
+        self._con.commit()
+
     def set_pinned(self, clip_id: int, pinned: bool) -> None:
         self._con.execute("UPDATE clips SET pinned=? WHERE id=?", (1 if pinned else 0, clip_id))
         self._con.commit()
@@ -301,6 +306,13 @@ class ClipMonitor(QObject):
         """
         self._suppress += n
         self._suppress_at = time.time()
+
+    def capture_now(self) -> None:
+        """复制后显式立即落库：不走 dataChanged（抑制残留可能吞掉本次变更，
+        50ms 合并也可能晚于窗口关闭），由本进程复制方主动触发。"""
+        self._timer.stop()
+        self._suppress = 0
+        self._flush()
 
     def _on_changed(self):
         if not self._enabled:
@@ -398,13 +410,19 @@ if __name__ == "__main__":
         "图片项应有 PNG 缩略图"
 
     st.set_pinned(a, True)
-    assert st.query()[0].id == a, "pinned 应置顶"
+    assert [i.id for i in st.query()] == [c, b, a], \
+        f"常用项不应置顶，仍按时间排序, 实际 {[i.id for i in st.query()]}"
     hits = st.query("b.jpg")
     assert [i.id for i in hits] == [c], "search 应命中 files"
     p = st.get_payload(b)
     assert p["formats"]["image/png"] == png_bytes and p["text"] == ""
 
     assert st.cleanup(0, 0) == 0, "days/max_entries 为 0 表示不清理"
+    # 常用项 = 免于定期清理（不是置顶）：最旧的 a 必须活下来，只删非常用的 b
+    n = st.cleanup(0, 1)
+    left = st.query()
+    assert [i.id for i in left] == [c, a] and n == 1, \
+        f"常用项应免于清理, 剩余 {[i.id for i in left]}, 删除 {n}"
     st.delete(b)
     assert all(i.id != b for i in st.query())
     st.set_pinned(a, False)

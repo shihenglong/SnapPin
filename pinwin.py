@@ -1,4 +1,4 @@
-"""贴图窗口 v3 — 贴图即取字（拖拽选字/点击复制）+ 分块并发翻译 + 译文按块替换。"""
+﻿"""贴图窗口 v3 — 贴图即取字（拖拽选字/点击复制）+ 分块并发翻译 + 译文按块替换。"""
 import time
 
 from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QSize, Qt, QTimer
@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (QApplication, QFrame, QGraphicsDropShadowEffect,
                                QGraphicsScene, QGraphicsView, QLabel, QMenu,
                                QWidget)
 
+import clipimg
 from icons import icon, APP_ICON_SVG
 from ocrtext_layer import OcrTextItemLayer
 
@@ -181,6 +182,7 @@ class PinWindow(QWidget):
         self._tr_blocks = []
         self._tr_results = []
         self._tr_wait = 0               # OCR 未完成时的自动重试轮次（防无限循环）
+        self._ocr_done = False          # 首次自动取字是否已出结果（成功/失败都算）
         self._esc_t0 = 0.0              # 上一次 Esc 时刻（双击 Esc 关闭用）
         self._toast_timer = QTimer(self, singleShot=True)
         self._toast_timer.timeout.connect(lambda: self._toast.hide())
@@ -280,13 +282,17 @@ class PinWindow(QWidget):
                   self.y() + int(rel.y() * (1 - factor)))
 
     def _toast_text(self, text, ms=1600):
+        """ms=0 表示常驻提示（如「翻译中...」），由调用方负责隐藏。"""
         self._toast.setText(text)
         self._toast.adjustSize()
         self._toast.move((self.width() - self._toast.width()) // 2,
                          max(0, self.height() - 40))
         self._toast.show()
         self._toast.raise_()
-        self._toast_timer.start(ms)
+        if ms > 0:
+            self._toast_timer.start(ms)
+        else:
+            self._toast_timer.stop()
 
     # ------------------------------------------------ 鼠标：文字上拖拽=选字，空白拖拽=移动
     def _ev_pos(self, e):
@@ -346,7 +352,7 @@ class PinWindow(QWidget):
     def mouseDoubleClickEvent(self, e):
         # 双击 = 复制贴图 → 自动进入剪贴板历史；不关闭（防误触）。
         # 关闭只走双击 Esc / 右键菜单 / Alt+2
-        QApplication.clipboard().setPixmap(self._current_pix())
+        clipimg.copy_image(self._current_pix())
         e.accept()
 
     def keyPressEvent(self, e):
@@ -390,10 +396,13 @@ class PinWindow(QWidget):
     # ------------------------------------------------ OCR
     def _auto_ocr(self, retry=0):
         if self._ocr is None:
+            self._ocr_done = True          # 没有 OCR：别让翻译白等
             return
         if self._ocr.busy():
             if retry < 6:
                 QTimer.singleShot(600, lambda: self._auto_ocr(retry + 1))
+            else:
+                self._ocr_done = True      # 等了 3.6s 仍在忙：放弃，翻译立即报无文字
             return
         self._ocr.done.connect(self._auto_ocr_done, Qt.UniqueConnection)
         self._ocr.failed.connect(self._auto_ocr_failed, Qt.UniqueConnection)
@@ -408,6 +417,7 @@ class PinWindow(QWidget):
 
     def _auto_ocr_done(self, items):
         self._unhook(self._auto_ocr_done, self._auto_ocr_failed)
+        self._ocr_done = True
         self._set_boxes([QRect(d["box"][0][0], d["box"][0][1],
                                d["box"][1][0] - d["box"][0][0],
                                d["box"][3][1] - d["box"][0][1]) for d in items],
@@ -416,6 +426,7 @@ class PinWindow(QWidget):
 
     def _auto_ocr_failed(self, msg):
         self._unhook(self._auto_ocr_done, self._auto_ocr_failed)
+        self._ocr_done = True
         if "正在进行" not in msg:
             self._toast_text(f"取字失败：{msg}")
 
@@ -508,16 +519,16 @@ class PinWindow(QWidget):
             return
         blocks = self._blocks()
         if not blocks:
-            # 刚贴上就点翻译：自动取字还在跑，OCR 完成后自动重试——不用再手动点
-            if self._ocr is not None and self._ocr.busy():
+            # 刚贴上就点翻译（钉图并翻译）：自动取字可能还没开始（60ms 后才触发）
+            # 或正在跑 → 等它出结果后自动重试，不误报无文字
+            if self._ocr is not None and not self._ocr_done and self._tr_wait < 20:
                 self._tr_wait += 1
-                if self._tr_wait <= 20:            # 最多等 ~12s
-                    self._toast_text("正在取字…完成后自动开始翻译", 2500)
-                    t = QTimer(self)               # 挂 self：窗口销毁计时器一并销毁
-                    t.setSingleShot(True)
-                    t.timeout.connect(self.translate_replace)
-                    t.start(600)
-                    return
+                self._toast_text("翻译中...", 0)
+                t = QTimer(self)               # 挂 self：窗口销毁计时器一并销毁
+                t.setSingleShot(True)
+                t.timeout.connect(self.translate_replace)
+                t.start(600)
+                return
             self._tr_wait = 0
             self._toast_text("未识别到文字", 2500)
             return
@@ -526,15 +537,12 @@ class PinWindow(QWidget):
         tgt_base = {"zh-CN": "zh", "zh-TW": "zh", "en": "en",
                     "ja": "ja", "ko": "ko"}.get(target, "zh")
         translatable = [b for b in blocks if self._block_lang(b["text"]) != tgt_base]
-        skipped = len(blocks) - len(translatable)
         if not translatable:
             self._toast_text("原文与目标语言相同，无需翻译")
             return
         self._tr_blocks = translatable
         self._tr_results = [None] * len(translatable)
-        self._tr_t0 = time.time()
-        self._toast_text(f"翻译 {len(translatable)} 块中…" +
-                         (f"（跳过 {skipped} 块同语言）" if skipped else ""), 3000)
+        self._toast_text("翻译中...", 0)
         self._translator.done.connect(self._tr_done, Qt.UniqueConnection)
         self._translator.failed.connect(self._tr_failed, Qt.UniqueConnection)
         # 整批一次请求：done 按输入顺序回传等长 list，与 translatable 一一对应
@@ -557,10 +565,9 @@ class PinWindow(QWidget):
         self._translated_pix = self._build_replaced(self._tr_blocks, self._tr_results)
         self._show_translated = True
         self._apply_pix()
-        elapsed = time.time() - getattr(self, "_tr_t0", time.time())
-        # 显示实际生效引擎：降级到词典兜底时一眼可见，效果差有因可查
-        eng = getattr(self._translator, "last_engine", "") or "翻译"
-        self._toast_text(f"译文已替换原图 · {eng} · {elapsed:.1f}s · 右键显示原文", 2600)
+        # 翻译完成：提示直接消失（译文已替换原图，右键可显示原文）
+        self._toast_timer.stop()
+        self._toast.hide()
 
     @staticmethod
     def _block_lang(t: str) -> str | None:
@@ -732,7 +739,7 @@ class PinWindow(QWidget):
             menu.addAction("复制全部文字", self._copy_all_text)
         menu.addSeparator()
         menu.addAction(icon("copy", "#4E5969"), "复制贴图",
-                       lambda: QApplication.clipboard().setPixmap(self._current_pix()))
+                       lambda: clipimg.copy_image(self._current_pix()))
         menu.addAction(icon("save", "#4E5969"), "保存", self._save)
         zoom = menu.addMenu("缩放")
         for pct in (50, 75, 100, 150, 200):
@@ -960,12 +967,28 @@ if __name__ == "__main__":
     pw._ocr = _FakeOcr(busy=True)                  # 自动取字还在跑 → 等待重试，不报无文字
     pw.translate_replace()
     assert tr.calls == [], "OCR 进行中不应发请求"
+    assert pw._toast.text() == "翻译中...", pw._toast.text()
+    assert pw._tr_wait == 1, pw._tr_wait
 
-    pw._ocr = _FakeOcr(busy=False)                 # 取字完成（模拟 OCR 回来）
+    pw._ocr = _FakeOcr(busy=False)
+    pw._ocr_done = True                            # 取字已出结果但没识别到文字
+    pw._tr_wait = 0
+    pw.translate_replace()
+    assert tr.calls == [], "无文字时不应发请求"
+    assert pw._toast.text() == "未识别到文字", pw._toast.text()
+
+    pw._ocr_done = False                           # 取字完成（模拟 OCR 回来）
     pw._set_boxes([QRect(20, 20, 260, 22)], ["The quick brown fox"])
     pw.translate_replace()
     assert tr.calls == [["The quick brown fox"]], f"应发起翻译: {tr.calls}"
     assert pw._tr_wait == 0, "正常路径应清零等待计数"
+
+    # 提示只显示「翻译中...」，翻译完成后消失（不弹统计文案）
+    pw._toast_text("翻译中...", 0)
+    assert not pw._toast.isHidden() and pw._toast.text() == "翻译中..."
+    pw._tr_done(["你好，世界。"], 0)
+    assert pw._toast.isHidden(), "翻译完成后提示应消失"
+    assert pw._show_translated and pw._translated_pix is not None
 
     # ---- 译文模式下选字高亮必须可见（此前直接 return，看起来选字失效）
     pw._translated_pix = pw._build_replaced(
@@ -996,7 +1019,20 @@ if __name__ == "__main__":
                       Qt.LeftButton, Qt.LeftButton, Qt.NoModifier)
     pw2.mouseDoubleClickEvent(dbl)
     assert pw2 in PinWindow.instances, "双击不得关闭贴图"
-    assert not QApplication.clipboard().pixmap().isNull(), "双击应复制贴图"
+    # Qt 侧的读取依赖 WM_CLIPBOARDUPDATE 刷新，自测没有真实消息泵，
+    # mimeData() 会停在旧缓存（真实运行有 app.exec，不受影响）——
+    # 这里直接验证系统剪贴板落下了 CF_DIB/CF_DIBV5。
+    import ctypes as _ct
+    _u = _ct.windll.user32
+    _u.OpenClipboard(None)
+    _formats, _f = set(), 0
+    while True:
+        _f = _u.EnumClipboardFormats(_f)
+        if not _f:
+            break
+        _formats.add(_f)
+    _u.CloseClipboard()
+    assert {8, 17} <= _formats, f"双击应复制贴图，剪贴板格式={sorted(_formats)}"
 
     esc = lambda: pw2.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Escape,
                                               Qt.NoModifier))

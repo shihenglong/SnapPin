@@ -1,4 +1,4 @@
-"""设置窗口 — 重设计：左侧图标导航 + 右侧滚动卡片 + 底部 确定/应用/取消。
+﻿"""设置窗口 — 重设计：左侧图标导航 + 右侧滚动卡片 + 底部 确定/应用/取消。
 
 - 所有页面的改动统一由底部按钮提交：确定=保存并关闭，应用=保存并留驻，取消/✕=丢弃。
 - 快捷键集中一页，按「截图与贴图」「剪贴板」分组（剪贴板历史热键也从剪贴板页并入此处）。
@@ -8,13 +8,14 @@ import json
 import os
 import tempfile
 
-from PySide6.QtCore import QSize, QUrl, Qt, Signal
+from PySide6.QtCore import QSize, QTimer, QUrl, Qt, Signal
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtNetwork import (QNetworkAccessManager, QNetworkReply,
                                QNetworkRequest)
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QFileDialog,
-                               QHBoxLayout, QLabel, QLineEdit, QListWidget,
-                               QListWidgetItem, QPushButton, QScrollArea,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
+                               QFileDialog, QHBoxLayout, QLabel, QLineEdit,
+                               QListWidget, QListWidgetItem, QMessageBox,
+                               QProgressBar, QPushButton, QScrollArea,
                                QSpinBox, QStackedWidget, QToolButton,
                                QVBoxLayout, QWidget)
 
@@ -22,6 +23,7 @@ import config
 import translate
 import updater
 import version
+from hotkeys import split_combos
 from icons import icon
 
 ACCENT = "#2E7CF6"
@@ -61,6 +63,8 @@ QToolButton{border:1px solid #DFE3EA;border-radius:6px;background:white;padding:
             color:#4E5969;font-size:12px;}
 QToolButton:hover{border-color:%ACC%;color:%ACC%;}
 #BtnBar{background:white;border-top:1px solid #ECEEF2;}
+QProgressBar{border:none;border-radius:3px;background:#EEF0F4;text-align:center;}
+QProgressBar::chunk{background:%ACC%;border-radius:3px;}
 QCheckBox::indicator{width:16px;height:16px;border:1px solid #C9CDD6;border-radius:4px;background:white;}
 QCheckBox::indicator:hover{border-color:%ACC%;}
 QCheckBox::indicator:checked{background:%ACC%;border-color:%ACC%;image:url(%CHECK%);}
@@ -90,8 +94,8 @@ _TR_ENGINES = [("online", "在线直连（免 Key）"), ("glm", "GLM API（智�
                ("minimax", "MiniMax API"), ("custom", "自定义 OpenAI 兼容"),
                ("ollama", "Ollama（本地大模型）"), ("local", "离线插件（神经翻译）")]
 _TR_PRESET_TIP = {
-    "online": "免 Key 免配置：Google GTX 直连 + MyMemory 容灾，逐块并发；"
-              "双通道都拿不到的块自动转离线插件补齐",
+    "online": "免 Key 免配置：必应 → Google GTX → MyMemory 三通道容灾，逐块并发；"
+              "三路都拿不到的块自动转离线插件补齐",
     "glm": "预设 https://open.bigmodel.cn/api/paas/v4 · glm-4.7-flash，一次请求批量翻译；未填 Key 自动用免 Key 在线直连",
     "minimax": "预设 https://api.minimaxi.com/v1 · MiniMax-M2；未填 Key 自动用免 Key 在线直连",
     "custom": "填写 OpenAI 兼容端点（到 /v1 为止）与模型名；未填 Key 自动用免 Key 在线直连",
@@ -114,18 +118,23 @@ _HK_PUNCT_KEYS = {
 
 
 class HotkeyEdit(QPushButton):
-    """点击后捕获下一个按键组合。"""
+    """点击后捕获下一个按键组合；Delete/Backspace 清空，空值显示「未设置」。"""
     changed = Signal(str)
+    _EMPTY_TEXT = "未设置"
 
     def __init__(self, combo, parent=None):
-        super().__init__(combo, parent)
-        self.combo = combo
+        super().__init__(parent)
+        self.combo = combo or ""
         self._capturing = False
         self.setFixedSize(170, 30)
         self.setCursor(Qt.PointingHandCursor)
         self.setStyleSheet(
             "QPushButton{border:1px solid #DFE3EA;border-radius:6px;background:white;}"
             "QPushButton:hover{border-color:%s;}" % ACCENT)
+        self._sync_text()
+
+    def _sync_text(self):
+        self.setText(self.combo or self._EMPTY_TEXT)
 
     def mousePressEvent(self, e):
         if not self._capturing:
@@ -140,7 +149,13 @@ class HotkeyEdit(QPushButton):
         mods = ev.modifiers()
         if key in (Qt.Key_Escape,):
             self._capturing = False
-            self.setText(self.combo)
+            self._sync_text()
+            return
+        if key in (Qt.Key_Delete, Qt.Key_Backspace):
+            self.combo = ""
+            self._capturing = False
+            self._sync_text()
+            self.changed.emit("")
             return
         if key in (Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta):
             return
@@ -167,9 +182,14 @@ class HotkeyEdit(QPushButton):
             return
         names.append(k)
         self.combo = "+".join(names)
-        self.setText(self.combo)
+        self._sync_text()
         self._capturing = False
         self.changed.emit(self.combo)
+
+
+def _join_combos(*combos) -> str:
+    """两个录入框 → 配置值（"Ctrl+1, Ctrl+Alt+1"）；空的框不写入。"""
+    return ", ".join([c for c in combos if c])
 
 
 _NAV = [("nav_system", "通用"), ("nav_shot", "截图"), ("nav_pin", "贴图"),
@@ -192,11 +212,9 @@ class SettingsDialog(QDialog):
         self._cfg = cfg
         self._on_apply = on_apply
         self.upd_status.connect(self._on_upd_status)
-
-    def __init__(self, cfg, on_apply, parent=None):
-        super().__init__(parent)
-        self._cfg = cfg
-        self._on_apply = on_apply
+        self._wired_flow = None      # 已订阅的 UpdateFlow（App 共享 / 自建）
+        self._own_flow = None
+        self._upd_prompted = False   # 「下载完成」确认框只自动弹一次
         self.setWindowTitle("SnapPin 设置")
         self.setObjectName("SettingsWin")
         self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
@@ -267,9 +285,29 @@ class SettingsDialog(QDialog):
         托盘菜单/单实例二启路径没有前台权限，activateWindow 会被 Windows
         静默拒绝而沉底——winfront.force_front 抬升并核实。
         """
+        self._wire_flow()            # App 共享 flow：打开即回放当前下载/就绪状态
         self.show()
         import winfront
         winfront.force_front(self)
+
+    # ================================================== 更新流程
+    def _flow(self):
+        """优先复用主程序的 UpdateFlow（下载不重复、状态两边一致）。"""
+        app = getattr(self, "_app", None)
+        flow = getattr(app, "_upd_flow", None) if app is not None else None
+        if flow is None:
+            if self._own_flow is None:
+                self._own_flow = updater.UpdateFlow()
+            flow = self._own_flow
+        return flow
+
+    def _wire_flow(self):
+        flow = self._flow()
+        if self._wired_flow is flow:
+            return flow
+        flow.subscribe(self.upd_status.emit)   # replay：立即补发最后状态
+        self._wired_flow = flow
+        return flow
 
     # ================================================== 页面骨架
     def _page(self, *cards):
@@ -688,28 +726,44 @@ class SettingsDialog(QDialog):
 
         reply.finished.connect(got_release)
 
-    # ---- 快捷键页：全部热键集中于此（剪贴板相关归一组）
+    def _hk_row(self, name: str, value, desc: str = ""):
+        """一行两个热键框：第二个留空 = 不启用第二快捷键。"""
+        parts = split_combos(value)
+        first = HotkeyEdit(parts[0] if parts else "")
+        second = HotkeyEdit(parts[1] if len(parts) > 1 else "")
+        for w in (first, second):
+            w.setFixedWidth(150)
+        box = QWidget()
+        h = QHBoxLayout(box)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(6)
+        h.addWidget(first)
+        h.addWidget(second)
+        return self._row(name, box, desc), first, second
+
+    # ---- 快捷键页：全部热键集中于此（每个功能可绑两个）
     def _page_hotkey(self):
         hk = self._cfg["hotkeys"]
-        self.hk_capture = HotkeyEdit(hk["capture"])
-        self.hk_pin = HotkeyEdit(hk["pin_clipboard"])
-        self.hk_close = HotkeyEdit(hk["close_all_pins"])
-        self.hk_hide = HotkeyEdit(hk["hide_show_pins"])
-        self.hk_clip = HotkeyEdit(self._cfg["clip"].get("hotkey", "Alt+V"))
+        r_cap, self.hk_capture, self.hk_capture2 = self._hk_row(
+            "截图", hk.get("capture"))
+        r_pin, self.hk_pin, self.hk_pin2 = self._hk_row(
+            "剪贴板贴图", hk.get("pin_clipboard"), "把剪贴板中的图片直接贴为置顶贴图")
+        r_close, self.hk_close, self.hk_close2 = self._hk_row(
+            "关闭所有贴图", hk.get("close_all_pins"))
+        r_hide, self.hk_hide, self.hk_hide2 = self._hk_row(
+            "隐藏 / 显示贴图", hk.get("hide_show_pins"))
+        r_clip, self.hk_clip, self.hk_clip2 = self._hk_row(
+            "打开剪贴板历史", self._cfg["clip"].get("hotkey", "Alt+V"),
+            "Ditto 式快贴窗口；再按一次关闭")
         return self._page(
-            self._card("截图与贴图", [
-                self._row("截图", self.hk_capture),
-                self._row("剪贴板贴图", self.hk_pin, "把剪贴板中的图片直接贴为置顶贴图"),
-                self._row("关闭所有贴图", self.hk_close),
-                self._row("隐藏 / 显示贴图", self.hk_hide),
-            ]),
-            self._card("剪贴板", [
-                self._row("打开剪贴板历史", self.hk_clip, "Ditto 式快贴窗口；再按一次关闭"),
-            ]),
+            self._card("截图与贴图", [r_cap, r_pin, r_close, r_hide]),
+            self._card("剪贴板", [r_clip]),
             self._card("说明", [
-                self._note("点击输入框后直接按下新的组合键即可录入（Ctrl / Alt / Shift / Win + "
+                self._note("每个功能可绑定两个快捷键：左框为主快捷键，右框留空即不启用。\n"
+                           "点击输入框后直接按下新的组合键即可录入（Ctrl / Alt / Shift / Win + "
                            "字母、数字、F1-F12 或主键盘符号 ` - = [ ] \\ ; ' , . /），"
-                           "按 Esc 取消。保存后立即生效；若与其他软件冲突会弹托盘通知。"),
+                           "Delete / Backspace 清空，Esc 取消。"
+                           "保存后立即生效；若与其他软件冲突会弹托盘通知。"),
             ]))
 
     def _page_about(self):
@@ -734,10 +788,16 @@ class SettingsDialog(QDialog):
         self.upd_label = QLabel("")
         self.upd_label.setProperty("note", True)
         self.upd_label.setWordWrap(True)
+        self.upd_bar = QProgressBar()
+        self.upd_bar.setRange(0, 1000)
+        self.upd_bar.setTextVisible(False)
+        self.upd_bar.setFixedHeight(6)
+        self.upd_bar.hide()
         return self._page(
             self._card("关于", [
                 ver_row,
                 self.upd_label,
+                self.upd_bar,
                 self.chk_updates,
                 self._note("OCR：RapidOCR（PaddleOCR ONNX，本地运行）\n"
                            "翻译：GLM / MiniMax / 自定义 OpenAI 兼容 API，或本地离线引擎\n"
@@ -749,39 +809,115 @@ class SettingsDialog(QDialog):
 
     # ================================================== 检查更新
     def _on_check_updates(self):
-        import updater
+        flow = self._wire_flow()
+        if flow.package:                     # 已下载好：直接进安装确认
+            self._confirm_install()
+            return
+        if not flow.start():                 # 已有链在跑，等它的状态回来
+            return
+        self._upd_prompted = False
         self.btn_check.setEnabled(False)
         self.btn_check.setText("正在检查…")
         self.upd_label.setText("")
-        updater.check_async(self.upd_status.emit)
+        self.upd_bar.hide()
 
     def _on_upd_status(self, status, payload):
-        self.btn_check.setEnabled(True)
-        self.btn_check.setText("检查更新")
-        if status == "update":
-            info = payload
-            self.upd_label.setText(
-                f"发现新版本 {info['tag']}（当前 v{version.APP_VERSION}），"
-                f"可到 Release 页下载。")
-            from PySide6.QtWidgets import QMessageBox
-            box = QMessageBox(self)
-            box.setWindowTitle("发现新版本")
-            box.setText(f"{version.APP_NAME} {info['tag']} 已发布"
-                        f"（当前 v{version.APP_VERSION}）。")
-            notes = (info.get("notes") or "").strip()
-            if notes:
-                box.setInformativeText(notes[:1500])
-            dl = box.addButton("前往下载", QMessageBox.AcceptRole)
-            box.addButton("以后再说", QMessageBox.RejectRole)
-            box.exec()
-            if box.clickedButton() is dl:
-                from PySide6.QtGui import QDesktopServices
-                from PySide6.QtCore import QUrl
-                QDesktopServices.openUrl(QUrl(info["url"]))
-        elif status == "latest":
+        if status == "checking":
+            self.btn_check.setEnabled(False)
+            self.btn_check.setText("正在检查…")
+            return
+        if status == "latest":
+            self.upd_bar.hide()
+            self.btn_check.setEnabled(True)
+            self.btn_check.setText("检查更新")
             self.upd_label.setText(f"已是最新版本 v{version.APP_VERSION}。")
-        else:
-            self.upd_label.setText(f"检查失败（{payload}）；请确认能访问 github.com。")
+            return
+        if status == "update":
+            self.upd_bar.setRange(0, 1000)
+            self.upd_bar.setValue(0)
+            self.upd_bar.show()
+            if not payload.get("can_install"):
+                self.upd_bar.hide()
+                self.btn_check.setEnabled(True)
+                self.btn_check.setText("检查更新")
+                self.upd_label.setText(
+                    f"发现新版本 {payload['tag']}（当前 v{version.APP_VERSION}）。"
+                    f"当前是源码运行，无法自动替换文件，请 git pull 或到 "
+                    f"Release 页下载发布包。")
+                return
+            self.btn_check.setEnabled(False)
+            self.btn_check.setText("正在下载…")
+            self.upd_label.setText(
+                f"发现新版本 {payload['tag']}（当前 v{version.APP_VERSION}），"
+                f"正在后台下载 {payload['asset']['name']}…")
+            return
+        if status == "downloading":
+            got, total = payload
+            if total:
+                self.upd_bar.setValue(int(got * 1000 / total))
+                self.upd_label.setText(
+                    f"正在下载 {got / 1048576:.1f} / {total / 1048576:.1f} MB"
+                    f"（{got * 100 // total}%）")
+            else:
+                self.upd_label.setText(f"正在下载 {got / 1048576:.1f} MB…")
+            return
+        if status == "downloaded":
+            self.upd_bar.setValue(1000)
+            self.upd_bar.show()
+            self.btn_check.setEnabled(True)
+            self.btn_check.setText("立即更新")
+            self.upd_label.setText(
+                f"{payload['tag']} 已下载并校验完成"
+                f"（{payload['size'] / 1048576:.0f} MB），"
+                f"点「立即更新」自动替换并重启。")
+            if not self._upd_prompted:
+                self._upd_prompted = True
+                self._confirm_install()
+            return
+        if status == "installing":
+            self.btn_check.setEnabled(False)
+            self.btn_check.setText("正在更新…")
+            self.upd_label.setText("程序即将关闭，更新脚本会替换文件并自动重启…")
+            return
+        # error
+        flow = self._flow()
+        self.upd_bar.hide()
+        self.btn_check.setEnabled(True)
+        self.btn_check.setText("立即更新" if flow.package else "检查更新")
+        self.upd_label.setText(str(payload))
+
+    def _confirm_install(self):
+        flow = self._flow()
+        if not flow.package:
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("更新已就绪")
+        box.setText(f"{version.APP_NAME} {flow.tag or ''} 已下载完成。")
+        box.setInformativeText(
+            "点「立即更新」会退出程序、替换文件并自动重新启动；"
+            "「稍后」保留安装包，之后回这一页点按钮即可。")
+        ok = box.addButton("立即更新", QMessageBox.AcceptRole)
+        box.addButton("稍后", QMessageBox.RejectRole)
+        box.setDefaultButton(ok)
+        box.exec()
+        if box.clickedButton() is ok:
+            self._do_install()
+
+    def _do_install(self):
+        flow = self._flow()
+        try:
+            self._collect()               # 先落盘：新版本起来还是这份配置
+            config.save(self.cfg)
+            flow.install()
+        except Exception as exc:
+            self.upd_label.setText(str(exc).splitlines()[0])
+            QMessageBox.warning(self, "无法自动更新", str(exc))
+            self.btn_check.setEnabled(True)
+            self.btn_check.setText("立即更新" if flow.package else "检查更新")
+            return
+        app = getattr(self, "_app", None)
+        QTimer.singleShot(400, app.quit if app is not None
+                          else lambda: QApplication.instance().quit())
 
     # ================================================== 提交
     def _open_pwman(self):
@@ -809,7 +945,7 @@ class SettingsDialog(QDialog):
         c["pin"]["opacity"] = self.pin_opacity.value()
         c["pin"]["shadow"] = self.pin_shadow.isChecked()
         c["clip"]["enabled"] = self.clip_enabled.isChecked()
-        c["clip"]["hotkey"] = self.hk_clip.combo
+        c["clip"]["hotkey"] = _join_combos(self.hk_clip.combo, self.hk_clip2.combo)
         c["clip"]["popup_pos"] = {0: "cursor", 1: "center", 2: "remember"}[
             self.clip_pos.currentIndex()]
         c["clip"]["retention_days"] = self.clip_days.value()
@@ -825,10 +961,12 @@ class SettingsDialog(QDialog):
         c["translate"]["api_key"] = self.tr_key.text().strip()
         c["translate"]["model"] = self.tr_model.text().strip()
         c["translate"]["target"] = self.tr_target.currentData()
-        c["hotkeys"]["capture"] = self.hk_capture.combo
-        c["hotkeys"]["pin_clipboard"] = self.hk_pin.combo
-        c["hotkeys"]["close_all_pins"] = self.hk_close.combo
-        c["hotkeys"]["hide_show_pins"] = self.hk_hide.combo
+        c["hotkeys"]["capture"] = _join_combos(self.hk_capture.combo, self.hk_capture2.combo)
+        c["hotkeys"]["pin_clipboard"] = _join_combos(self.hk_pin.combo, self.hk_pin2.combo)
+        c["hotkeys"]["close_all_pins"] = _join_combos(self.hk_close.combo,
+                                                      self.hk_close2.combo)
+        c["hotkeys"]["hide_show_pins"] = _join_combos(self.hk_hide.combo,
+                                                      self.hk_hide2.combo)
 
     def _apply_all(self):
         self._collect()
@@ -887,6 +1025,22 @@ if __name__ == "__main__":
                                    Qt.ControlModifier | Qt.AltModifier, text="x"))
         assert he.combo == f"Ctrl+Alt+{name}", f"应捕获 Ctrl+Alt+{name}，实际 {he.combo!r}"
         assert _pc(he.combo) is not None, f"{he.combo} 应能被注册端解析"
+
+    # 双快捷键：第二个框录入后保存成「主, 备」；Delete 清空后只留主键
+    he2 = dlg.hk_capture2
+    he2._capturing = True
+    he2.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_9,
+                                Qt.ControlModifier | Qt.AltModifier, text="9"))
+    assert he2.combo == "Ctrl+Alt+9", he2.combo
+    dlg._collect()
+    assert dlg._cfg["hotkeys"]["capture"] == "Ctrl+1, Ctrl+Alt+9", \
+        dlg._cfg["hotkeys"]["capture"]
+    assert split_combos(dlg._cfg["hotkeys"]["capture"]) == ["Ctrl+1", "Ctrl+Alt+9"]
+    he2._capturing = True
+    he2.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Delete, Qt.NoModifier))
+    assert he2.combo == "" and he2.text() == "未设置", (he2.combo, he2.text())
+    dlg._collect()
+    assert dlg._cfg["hotkeys"]["capture"] == "Ctrl+1", dlg._cfg["hotkeys"]["capture"]
 
     # 翻译页：切换到本地引擎应隐藏 API 行
     assert dlg._row_key.isVisible() is False or True  # 离屏下可见性不可靠，仅冒烟
